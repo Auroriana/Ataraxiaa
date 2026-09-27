@@ -1,32 +1,71 @@
-# React + TypeScript + Vite
+# Ataraxia
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A personal budgeting and financial tracking web application designed to make managing everyday finances simple, visual, and accessible across devices.
 
-Currently, two official plugins are available:
+Ataraxia uses Firebase for authentication and cloud data storage, allowing users to keep their budgeting data synchronized between devices.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Features
 
-## React Compiler
+- Personal budget and expense tracking
+- Firebase-powered cloud data synchronization
+- Anonymous authentication for immediate use
+- Google sign-in with account linking
+- Cross-device access to synchronized data
+- User-specific Firestore data
+- Responsive web interface
+- Deployed with Vercel
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## How Authentication Works
 
-## Expanding the Oxlint configuration
+Ataraxia allows users to start using the application immediately without creating an account manually.
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+### Anonymous Authentication
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
+On first use, Ataraxia creates an anonymous Firebase account for the user.
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+This allows the application to:
+
+- Start working immediately
+- Associate data with a unique Firebase user ID
+- Store the user's data securely in Firestore
+
+### Google Sign-In
+
+When the user chooses **Continue with Google**, Ataraxia links the Google account to the existing anonymous Firebase account rather than simply creating a completely separate session.
+
+This means data already entered while using the application anonymously can remain associated with the user's account after Google sign-in.
+
+Once linked, signing into the same Google account on another device allows the application to access the same Firebase user and synchronized Firestore data.
+
+### Signing Out
+
+Signing out ends the authenticated Google session.
+
+Ataraxia intentionally does not immediately create a new anonymous account after sign-out. Instead, the user is shown a sign-in screen so their existing data does not appear to have disappeared simply because they signed out.
+
+## Tech Stack
+
+- React
+- TypeScript
+- Vite
+- Firebase Authentication
+- Cloud Firestore
+- Vercel
+- Tailwind CSS
+
+## Project Structure
+
+The project follows a standard Vite/React structure.
+
+```text
+Ataraxia/
+├── public/
+├── src/
+│   ├── ...
+│   └── vite-env.d.ts
+├── .env.local
+├── .gitignore
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+└── README.md
