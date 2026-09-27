@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import type { Dispatch, FormEvent, ReactNode, SetStateAction } from 'react';
-import type { LucideIcon } from 'lucide-react';
+import type { FormEvent } from 'react';
 import { 
   ChevronLeft, ChevronRight, Settings, Calendar as CalendarIcon, 
   Plus, Trash2, X, AlertTriangle, Download, PieChart as PieChartIcon, 
@@ -8,67 +7,73 @@ import {
   ArrowDownToLine, ArrowUpFromLine, HandCoins,
   History, Save, Target, CreditCard
 } from 'lucide-react';
+
 import { 
   PieChart, Pie, Cell, Tooltip as RechartsTooltip, 
   ResponsiveContainer, Legend 
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
+
 import { 
   getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
+
 import { 
-  getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc
+  getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, updateDoc, query
 } from 'firebase/firestore';
+
 import type { Firestore } from 'firebase/firestore';
 
-declare const __firebase_config: string | undefined;
-declare const __app_id: string | undefined;
-declare const __initial_auth_token: string | undefined;
-
 type Frequency = 'daily' | 'monthly';
-type Tab = 'calendar' | 'savings' | 'insights' | 'settings';
-type LinkedType = 'goal' | 'debt' | null;
-type ExceptionType = 'absent' | 'expense_skip' | 'income_skip';
 
-interface WorkOverride { start: string; end: string; days: number[]; }
+interface WorkOverride {
+  start: string;
+  end: string;
+  days: number[];
+}
+
 interface AppSettings {
-  cutoffs: number[]; defaultWorkDays: number[]; workOverrides: WorkOverride[];
-  healthThresholds: { safe: number; caution: number; danger?: number };
+  cutoffs: number[];
+  defaultWorkDays: number[];
+  workOverrides: WorkOverride[];
+  healthThresholds: {
+    safe: number;
+    caution: number;
+    danger?: number;
+  };
 }
-interface Expense { id: string; date: string; amount: number | string; description: string; name?: string; category?: string; linkedType?: LinkedType; linkedTo?: string | null; createdAt?: string; ruleId?: string; }
-interface Income { id: string; date: string; amount: number | string; name: string; description?: string; category?: string; linkedTo?: string | null; isReceived: boolean; createdAt?: string; ruleId?: string; }
-interface FixedExpense { id: string; name: string; amount: number | string; frequency: Frequency; date: number | string | null; workingDaysOnly: boolean; createdAt?: string; category?: string; }
-interface IncomeRule { id: string; name: string; amount: number | string; frequency: Frequency; date: number | string | null; workingDaysOnly: boolean; category: string; createdAt?: string; }
-interface ExceptionEntry { id: string; date: string; type: ExceptionType; targetId: string | null; }
-interface SavingsGoal { id: string; name: string; targetAmount: number | string; createdAt?: string; }
-interface Debt { id: string; name: string; initialAmount: number | string; createdAt?: string; }
-interface CycleStats { expectedIncome: number; cycleReceivedIncome: number; cycleFixed: number; cycleManualExpenses: number; totalExpenses: number; availableReality: number; healthPercent: number; healthState: 'safe' | 'caution' | 'danger'; startStr: string; endStr: string; }
-interface NavButtonProps { icon: LucideIcon; label: string; active: boolean; onClick: () => void; }
-interface StatsHeaderProps { stats: CycleStats; isCurrent: boolean; }
-interface StatCardProps { title: string; value: number; icon: ReactNode; className?: string; highlight?: boolean; }
-interface MergedCalendarViewProps {
-  calendarMonth: Date; setCalendarMonth: Dispatch<SetStateAction<Date>>; settings: AppSettings;
-  expenses: Expense[]; fixedExpenses: FixedExpense[]; incomes: Income[]; incomeRules: IncomeRule[]; exceptions: ExceptionEntry[];
-  viewedStart: string; viewedEnd: string; todayStart: string; todayEnd: string; openDayModal: (date: string) => void;
-  showIncome: boolean; setShowIncome: Dispatch<SetStateAction<boolean>>; showExpenses: boolean; setShowExpenses: Dispatch<SetStateAction<boolean>>;
+
+interface FixedExpense {
+  id: string;
+  name: string;
+  amount: number | string;
+  frequency: Frequency;
+  date: number | string | null;
+  workingDaysOnly: boolean;
+  createdAt?: string;
+  category?: string;
 }
-interface SavingsDebtViewProps { user: User | null; db: Firestore | null; appId: string; savingsGoals: SavingsGoal[]; debts: Debt[]; expenses: Expense[]; }
-interface DayDetailsModalProps {
-  isOpen: boolean; onClose: () => void; dateStr: string | null; expenses: Expense[]; fixedExpenses: FixedExpense[];
-  incomes: Income[]; incomeRules: IncomeRule[]; exceptions: ExceptionEntry[]; settings: AppSettings;
-  savingsGoals: SavingsGoal[]; debts: Debt[]; user: User | null; db: Firestore | null; appId: string;
+
+interface IncomeRule {
+  id: string;
+  name: string;
+  amount: number | string;
+  frequency: Frequency;
+  date: number | string | null;
+  workingDaysOnly: boolean;
+  category: string;
+  createdAt?: string;
 }
-type ConfirmData =
-  | { action: 'delete'; type: 'expense' | 'income'; data: Expense | Income }
-  | { action: 'skip'; type: 'fixedExp' | 'fixedInc'; data: FixedExpense | IncomeRule }
-  | { action: 'toggleAbsent' }
-  | { action: 'markReceived'; type: 'fixedInc'; data: IncomeRule };
-type ConfirmVariant = 'danger' | 'warning' | 'primary';
-interface ConfirmDetails { title: string; message: string; confirmText: string; variant: ConfirmVariant; }
-interface ConfirmModalProps { isOpen: boolean; title: string; message: string; onConfirm: () => void | Promise<void>; onCancel: () => void; confirmText?: string; variant?: ConfirmVariant; }
-interface InsightsViewProps { expenses: Expense[]; incomes: Income[]; stats: CycleStats; }
-interface SettingsViewProps { settings: AppSettings; user: User | null; db: Firestore | null; appId: string; fixedExpenses: FixedExpense[]; incomeRules: IncomeRule[]; }
+
+interface SettingsViewProps {
+  settings: AppSettings;
+  user: User | null;
+  db: Firestore | null;
+  appId: string;
+  fixedExpenses: FixedExpense[];
+  incomeRules: IncomeRule[];
+}
 
 const DEFAULT_EXPENSE_CATEGORIES = ['Food', 'Transport', 'Utilities', 'Entertainment', 'Shopping', 'Other'];
 const DEFAULT_INCOME_CATEGORIES = ['Salary', 'Freelance', 'Gift', 'Reimbursement', 'Investment', 'Other'];
@@ -138,24 +143,24 @@ const THEME_STYLES = `
   }
 `;
 
-const formatPHP = (amount: number | string | null | undefined) => {
-  return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(Number(amount) || 0);
+const formatPHP = (amount) => {
+  return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(amount || 0);
 };
 
-const toYYYYMMDD = (date: Date) => {
+const toYYYYMMDD = (date) => {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
 };
 
-const getActivePeriod = (targetDate: Date, cutoffs: number[] = [13, 29]) => {
+const getActivePeriod = (targetDate, cutoffs = [13, 29]) => {
   if (!cutoffs || cutoffs.length === 0) cutoffs = [13, 29];
   const d = new Date(targetDate);
   const year = d.getFullYear();
   const month = d.getMonth();
 
-  let candidates: Date[] = [];
+  let candidates = [];
   [-2, -1, 0, 1, 2].forEach(offset => {
     let m = month + offset;
     let y = year;
@@ -189,7 +194,7 @@ const getActivePeriod = (targetDate: Date, cutoffs: number[] = [13, 29]) => {
   return { start, end };
 };
 
-const getBaseWorkDay = (dateStr: string, dateObj: Date, settings: AppSettings) => {
+const getBaseWorkDay = (dateStr, dateObj, settings) => {
   if (settings.workOverrides && settings.workOverrides.length > 0) {
     const override = settings.workOverrides.find(ov => dateStr >= ov.start && dateStr <= ov.end);
     if (override) return override.days.includes(dateObj.getDay());
@@ -198,7 +203,7 @@ const getBaseWorkDay = (dateStr: string, dateObj: Date, settings: AppSettings) =
   return defaultPattern.includes(dateObj.getDay());
 };
 
-const isAbsent = (dateStr: string, exceptions: ExceptionEntry[]) => {
+const isAbsent = (dateStr, exceptions) => {
   return exceptions.some(e => e.date === dateStr && e.type === 'absent');
 };
 
@@ -209,33 +214,32 @@ const db = app ? getFirestore(app) : null;
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>('calendar'); // 'calendar', 'savings', 'insights', 'settings'
+  const [user, setUser] = useState(null);
+  const [activeTab, setActiveTab] = useState('calendar'); // 'calendar', 'savings', 'insights', 'settings'
   
-  const [settings, setSettings] = useState<AppSettings>({
-    cutoffs: [13, 29], defaultWorkDays: [1, 2, 3, 4, 5], workOverrides: [],
-    healthThresholds: { safe: 50, caution: 20, danger: 20 }
+  const [settings, setSettings] = useState({ 
+    cutoffs: [13, 29], defaultWorkDays: [1, 2, 3, 4, 5], workOverrides: [], healthThresholds: { safe: 50, caution: 20 }
   });
   
   // Collections State
-  const [expenses, setExpenses] = useState<Expense[]>([]);
-  const [fixedExpenses, setFixedExpenses] = useState<FixedExpense[]>([]);
-  const [incomeRules, setIncomeRules] = useState<IncomeRule[]>([]);
-  const [incomes, setIncomes] = useState<Income[]>([]); 
-  const [exceptions, setExceptions] = useState<ExceptionEntry[]>([]); 
-  const [savingsGoals, setSavingsGoals] = useState<SavingsGoal[]>([]);
-  const [debts, setDebts] = useState<Debt[]>([]);
+  const [expenses, setExpenses] = useState([]);
+  const [fixedExpenses, setFixedExpenses] = useState([]);
+  const [incomeRules, setIncomeRules] = useState([]);
+  const [incomes, setIncomes] = useState([]); 
+  const [exceptions, setExceptions] = useState([]); 
+  const [savingsGoals, setSavingsGoals] = useState([]);
+  const [debts, setDebts] = useState([]);
   
   // Navigation State
-  const [viewedCycleAnchor, setViewedCycleAnchor] = useState<Date>(new Date()); 
-  const [calendarMonth, setCalendarMonth] = useState<Date>(new Date()); 
+  const [viewedCycleAnchor, setViewedCycleAnchor] = useState(new Date()); 
+  const [calendarMonth, setCalendarMonth] = useState(new Date()); 
 
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [selectedDateStr, setSelectedDateStr] = useState<string | null>(null);
+  const [selectedDateStr, setSelectedDateStr] = useState(null);
 
   // Calendar view toggles
-  const [showIncome, setShowIncome] = useState<boolean>(true);
-  const [showExpenses, setShowExpenses] = useState<boolean>(true);
+  const [showIncome, setShowIncome] = useState(true);
+  const [showExpenses, setShowExpenses] = useState(true);
 
   useEffect(() => {
     if (!auth) return;
@@ -259,15 +263,15 @@ export default function App() {
     
     const unsubs = [
       onSnapshot(doc(db, basePath, 'settings', 'config'), (snap) => {
-        if (snap.exists()) setSettings(prev => ({ ...prev, ...(snap.data() as Partial<AppSettings>) }));
+        if (snap.exists()) setSettings(prev => ({...prev, ...snap.data()}));
       }),
-      onSnapshot(collection(db, basePath, 'expenses'), (snap) => setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Expense))),
-      onSnapshot(collection(db, basePath, 'fixedExpenses'), (snap) => setFixedExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() }) as FixedExpense))),
-      onSnapshot(collection(db, basePath, 'incomeRules'), (snap) => setIncomeRules(snap.docs.map(d => ({ id: d.id, ...d.data() }) as IncomeRule))),
-      onSnapshot(collection(db, basePath, 'incomes'), (snap) => setIncomes(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Income))),
-      onSnapshot(collection(db, basePath, 'exceptions'), (snap) => setExceptions(snap.docs.map(d => ({ id: d.id, ...d.data() }) as ExceptionEntry))),
-      onSnapshot(collection(db, basePath, 'savingsGoals'), (snap) => setSavingsGoals(snap.docs.map(d => ({ id: d.id, ...d.data() }) as SavingsGoal))),
-      onSnapshot(collection(db, basePath, 'debts'), (snap) => setDebts(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Debt)))
+      onSnapshot(collection(db, basePath, 'expenses'), (snap) => setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'fixedExpenses'), (snap) => setFixedExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'incomeRules'), (snap) => setIncomeRules(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'incomes'), (snap) => setIncomes(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'exceptions'), (snap) => setExceptions(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'savingsGoals'), (snap) => setSavingsGoals(snap.docs.map(d => ({ id: d.id, ...d.data() })))),
+      onSnapshot(collection(db, basePath, 'debts'), (snap) => setDebts(snap.docs.map(d => ({ id: d.id, ...d.data() }))))
     ];
 
     return () => unsubs.forEach(u => u());
@@ -317,7 +321,7 @@ export default function App() {
     const availableReality = cycleReceivedIncome - totalExpenses;
     const healthPercent = expectedIncome > 0 ? (availableReality / expectedIncome) * 100 : 0;
     
-    let healthState: CycleStats['healthState'] = 'safe';
+    let healthState = 'safe';
     if (healthPercent <= (settings.healthThresholds?.danger || 20) || availableReality < 0) healthState = 'danger';
     else if (healthPercent <= (settings.healthThresholds?.caution || 50)) healthState = 'caution';
 
@@ -458,7 +462,7 @@ export default function App() {
   );
 }
 
-function NavButton({ icon: Icon, label, active, onClick }: NavButtonProps) {
+function NavButton({ icon: Icon, label, active, onClick }) {
   return (
     <button onClick={onClick} title={label} className={`p-2 rounded-lg transition-all flex items-center gap-1.5 ${active ? 'bg-[var(--atx-accent-light)] text-[var(--atx-accent)] font-semibold shadow-sm' : 'text-gray-500 hover:bg-gray-100'}`}>
       <Icon className="w-5 h-5" />
@@ -467,7 +471,7 @@ function NavButton({ icon: Icon, label, active, onClick }: NavButtonProps) {
   );
 }
 
-function StatsHeader({ stats, isCurrent }: StatsHeaderProps) {
+function StatsHeader({ stats, isCurrent }) {
   const { expectedIncome, cycleReceivedIncome, totalExpenses, availableReality, healthState } = stats;
 
   return (
@@ -492,7 +496,7 @@ function StatsHeader({ stats, isCurrent }: StatsHeaderProps) {
   );
 }
 
-function StatCard({ title, value, icon, className = "", highlight = false }: StatCardProps) {
+function StatCard({ title, value, icon, className = "", highlight = false }) {
   return (
     <div className={`atx-card p-4 rounded-xl shadow-sm flex flex-col justify-between h-full ${className}`}>
       <div className="flex justify-between items-center mb-2">
@@ -509,14 +513,14 @@ function StatCard({ title, value, icon, className = "", highlight = false }: Sta
 function MergedCalendarView({ 
   calendarMonth, setCalendarMonth, settings, expenses, fixedExpenses, incomes, incomeRules, exceptions,
   viewedStart, viewedEnd, todayStart, todayEnd, openDayModal, showIncome, setShowIncome, showExpenses, setShowExpenses
-}: MergedCalendarViewProps) {
+}) {
   const year = calendarMonth.getFullYear();
   const month = calendarMonth.getMonth();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
   const firstDayOfWeek = new Date(year, month, 1).getDay();
   const todayStr = toYYYYMMDD(new Date());
 
-  const days: (Date | null)[] = Array<Date | null>(firstDayOfWeek).fill(null);
+  const days = Array(firstDayOfWeek).fill(null);
   for (let i = 1; i <= daysInMonth; i++) days.push(new Date(year, month, i));
 
   return (
@@ -612,8 +616,8 @@ function MergedCalendarView({
                 </div>
                 
                 <div className="flex flex-col items-end gap-0.5">
-                  {!baseWorkDay && <CalendarOff className="w-3 h-3 text-gray-400" aria-label="Scheduled Off Day"/>}
-                  {isDayAbsent && <div className="w-3.5 h-3.5 rounded bg-red-100 flex items-center justify-center"><X className="w-2.5 h-2.5 text-red-500" aria-label="Marked Absent"/></div>}
+                  {!baseWorkDay && <CalendarOff className="w-3 h-3 text-gray-400" title="Scheduled Off Day"/>}
+                  {isDayAbsent && <div className="w-3.5 h-3.5 rounded bg-red-100 flex items-center justify-center"><X className="w-2.5 h-2.5 text-red-500" title="Marked Absent"/></div>}
                 </div>
               </div>
 
@@ -638,27 +642,27 @@ function MergedCalendarView({
   );
 }
 
-function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: SavingsDebtViewProps) {
+function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }) {
   const [goalName, setGoalName] = useState('');
   const [goalTarget, setGoalTarget] = useState('');
   const [debtName, setDebtName] = useState('');
   const [debtInitial, setDebtInitial] = useState('');
 
-  const handleAddGoal = async (e: FormEvent<HTMLFormElement>) => {
+  const handleAddGoal = async (e) => {
     e.preventDefault();
     if (!user || !db || !goalName || !goalTarget) return;
     await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'savingsGoals'), { name: goalName, targetAmount: parseFloat(goalTarget), createdAt: new Date().toISOString() });
     setGoalName(''); setGoalTarget('');
   };
 
-  const handleAddDebt = async (e: FormEvent<HTMLFormElement>) => {
+  const handleAddDebt = async (e) => {
     e.preventDefault();
     if (!user || !db || !debtName || !debtInitial) return;
     await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'debts'), { name: debtName, initialAmount: parseFloat(debtInitial), createdAt: new Date().toISOString() });
     setDebtName(''); setDebtInitial('');
   };
 
-  const deleteItem = async (coll: 'savingsGoals' | 'debts', id: string) => {
+  const deleteItem = async (coll, id) => {
     if(!user || !db) return;
     await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, coll, id));
   };
@@ -666,13 +670,13 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: Sav
   // Compute progress/balances based on linked expenses
   const goalsWithProgress = savingsGoals.map(g => {
     const saved = expenses.filter(e => e.linkedType === 'goal' && e.linkedTo === g.id).reduce((s, e) => s + Number(e.amount), 0);
-    return { ...g, saved, pct: Math.min(100, (saved / (Number(g.targetAmount) || 1)) * 100) };
+    return { ...g, saved, pct: Math.min(100, (saved / (g.targetAmount || 1)) * 100) };
   });
 
   const debtsWithBalance = debts.map(d => {
     const paid = expenses.filter(e => e.linkedType === 'debt' && e.linkedTo === d.id).reduce((s, e) => s + Number(e.amount), 0);
     const balance = Math.max(0, Number(d.initialAmount) - paid);
-    return { ...d, paid, balance, pct: Math.min(100, (paid / (Number(d.initialAmount) || 1)) * 100) };
+    return { ...d, paid, balance, pct: Math.min(100, (paid / (d.initialAmount || 1)) * 100) };
   });
 
   return (
@@ -749,14 +753,14 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: Sav
 function DayDetailsModal({ 
   isOpen, onClose, dateStr, expenses, fixedExpenses, incomes, incomeRules, exceptions, settings,
   savingsGoals, debts, user, db, appId 
-}: DayDetailsModalProps) {
-  const [subTab, setSubTab] = useState<'expense' | 'income'>('expense'); // 'expense' or 'income'
+}) {
+  const [subTab, setSubTab] = useState('expense'); // 'expense' or 'income'
   const [amount, setAmount] = useState('');
   const [descName, setDescName] = useState('');
   const [category, setCategory] = useState('');
   const [linkedTo, setLinkedTo] = useState(''); // "goal_id" or "debt_id" or ""
   
-  const [confirmData, setConfirmData] = useState<ConfirmData | null>(null); 
+  const [confirmData, setConfirmData] = useState(null); 
 
   useEffect(() => { if (isOpen) { setSubTab('expense'); setAmount(''); setDescName(''); setLinkedTo(''); } }, [isOpen]);
 
@@ -771,15 +775,15 @@ function DayDetailsModal({
   const customExp = expenses.filter(e => e.date === dateStr);
   const customInc = incomes.filter(i => i.date === dateStr);
 
-  const handleAdd = async (e: FormEvent<HTMLFormElement>) => {
+  const handleAdd = async (e) => {
     e.preventDefault();
     if (!amount || !descName || !user || !db) return;
 
-    let linkedType: LinkedType = null;
-    let finalLinkedTo: string | null = null;
+    let linkedType = null;
+    let finalLinkedTo = null;
     if (subTab === 'expense' && linkedTo) {
       const [type, id] = linkedTo.split('_');
-      linkedType = type === 'goal' || type === 'debt' ? type : null;
+      linkedType = type;
       finalLinkedTo = id;
     }
 
@@ -797,53 +801,40 @@ function DayDetailsModal({
   const executeAction = async () => {
     if (!confirmData || !user || !db) return;
     try {
-      if (confirmData.action === 'delete') {
-        const coll = confirmData.type === 'expense' ? 'expenses' : 'incomes';
-        await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, coll, confirmData.data.id));
-      } else if (confirmData.action === 'skip') {
-        const skipType = confirmData.type === 'fixedExp' ? 'expense_skip' : 'income_skip';
-        await addDoc(
-          collection(db, 'artifacts', appId, 'users', user.uid, 'exceptions'),
-          { date: dateStr, type: skipType, targetId: confirmData.data.id }
-        );
-      } else if (confirmData.action === 'toggleAbsent') {
+      const { type, action, data } = confirmData;
+      if (action === 'delete') {
+        const coll = type === 'expense' ? 'expenses' : 'incomes';
+        await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, coll, data.id));
+      } else if (action === 'skip') {
+        const skipType = type === 'fixedExp' ? 'expense_skip' : 'income_skip';
+        await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'exceptions'), { date: dateStr, type: skipType, targetId: data.id });
+      } else if (action === 'toggleAbsent') {
         if (isDayAbsent) {
           const docFind = exceptions.find(e => e.date === dateStr && e.type === 'absent');
-          if (docFind) {
-            await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'exceptions', docFind.id));
-          }
+          if (docFind) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'exceptions', docFind.id));
         } else {
-          await addDoc(
-            collection(db, 'artifacts', appId, 'users', user.uid, 'exceptions'),
-            { date: dateStr, type: 'absent', targetId: null }
-          );
+          await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'exceptions'), { date: dateStr, type: 'absent', targetId: null });
         }
-      } else if (confirmData.action === 'markReceived') {
+      } else if (action === 'markReceived') {
         await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'incomes'), {
-          date: dateStr,
-          amount: confirmData.data.amount,
-          name: confirmData.data.name,
-          category: confirmData.data.category,
-          ruleId: confirmData.data.id,
-          isReceived: true,
-          createdAt: new Date().toISOString(),
+          date: dateStr, amount: data.amount, name: data.name, category: data.category, ruleId: data.id, isReceived: true, createdAt: new Date().toISOString()
         });
       }
       setConfirmData(null);
     } catch (err) { console.error(err); }
   };
 
-  const getConfirmationDetails = (): ConfirmDetails | null => {
-    if (!confirmData) return null;
-    if (confirmData.action === 'delete') return { title: 'Delete Entry?', message: 'Permanently remove this manual record?', confirmText: 'Delete', variant: 'danger' };
-    if (confirmData.action === 'skip') return { title: 'Skip Schedule?', message: `Skip "${confirmData.data.name}" for this date only?`, confirmText: 'Skip Today', variant: 'warning' };
+  const getConfirmationDetails = () => {
+    if (!confirmData) return {};
+    if (confirmData.action === 'delete') return { title: 'Delete Entry?', msg: 'Permanently remove this manual record?', text: 'Delete', variant: 'danger' };
+    if (confirmData.action === 'skip') return { title: 'Skip Schedule?', msg: `Skip "${confirmData.data.name}" for this date only?`, text: 'Skip Today', variant: 'warning' };
     if (confirmData.action === 'toggleAbsent') return { 
       title: isDayAbsent ? 'Remove Absence?' : 'Mark as Absent?', 
-      message: isDayAbsent ? 'Restore working-days-only entries for this date?' : 'Cancel all working-days-only expenses and incomes for this date.',
-      confirmText: isDayAbsent ? 'Restore' : 'Mark Absent', variant: isDayAbsent ? 'primary' : 'warning'
+      msg: isDayAbsent ? 'Restore working-days-only entries for this date?' : 'Cancel all working-days-only expenses and incomes for this date.',
+      text: isDayAbsent ? 'Restore' : 'Mark Absent', variant: isDayAbsent ? 'primary' : 'warning'
     };
-    if (confirmData.action === 'markReceived') return { title: 'Mark Received?', message: `Confirm receipt of ${formatPHP(confirmData.data.amount)} from ${confirmData.data.name}?`, confirmText: 'Confirm', variant: 'primary' };
-    return null;
+    if (confirmData.action === 'markReceived') return { title: 'Mark Received?', msg: `Confirm receipt of ${formatPHP(confirmData.data.amount)} from ${confirmData.data.name}?`, text: 'Confirm', variant: 'primary' };
+    return {};
   };
 
   const cDetails = getConfirmationDetails();
@@ -979,14 +970,14 @@ function DayDetailsModal({
       </div>
 
       <ConfirmModal 
-        isOpen={!!confirmData} {...(cDetails ?? { title: '', message: '', confirmText: 'Confirm', variant: 'danger' })}
+        isOpen={!!confirmData} {...cDetails}
         onConfirm={executeAction} onCancel={() => setConfirmData(null)}
       />
     </>
   );
 }
 
-function ConfirmModal({ isOpen, title, message, onConfirm, onCancel, confirmText = "Confirm", variant = "danger" }: ConfirmModalProps) {
+function ConfirmModal({ isOpen, title, message, onConfirm, onCancel, confirmText = "Confirm", variant = "danger" }) {
   if (!isOpen) return null;
   const btnClass = variant === "danger" ? "bg-red-600 hover:bg-red-700" : variant === "warning" ? "bg-orange-500 hover:bg-orange-600" : "bg-[var(--atx-accent)] hover:bg-[var(--atx-accent-hover)]";
   
@@ -1005,11 +996,11 @@ function ConfirmModal({ isOpen, title, message, onConfirm, onCancel, confirmText
   );
 }
 
-function InsightsView({ expenses, incomes, stats }: InsightsViewProps) {
+function InsightsView({ expenses, incomes, stats }) {
   const [metricType, setMetricType] = useState('expense'); 
   
   const chartData = useMemo(() => {
-    const dataMap: Record<string, number> = {};
+    const dataMap = {};
     const categories = metricType === 'expense' ? DEFAULT_EXPENSE_CATEGORIES : DEFAULT_INCOME_CATEGORIES;
     const sourceData = metricType === 'expense' ? expenses : incomes;
     categories.forEach(c => dataMap[c] = 0);
@@ -1059,9 +1050,11 @@ function InsightsView({ expenses, incomes, stats }: InsightsViewProps) {
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie data={chartData} cx="50%" cy="50%" innerRadius={70} outerRadius={100} paddingAngle={4} dataKey="value">
-                  {chartData.map((_, i) => <Cell key={`cell-${i}`} fill={COLORS[i % COLORS.length]} />)}
+                  {chartData.map((_, i) => (
+						<Cell key={`cell-${i}`} fill={COLORS[i % COLORS.length]} />
+					))}
                 </Pie>
-                <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}/>
+                <RechartsTooltip formatter={(val) => formatPHP(val)} contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}/>
                 <Legend verticalAlign="bottom" height={36} iconType="circle"/>
               </PieChart>
             </ResponsiveContainer>
@@ -1080,12 +1073,32 @@ function InsightsView({ expenses, incomes, stats }: InsightsViewProps) {
   );
 }
 
-function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }: SettingsViewProps) {
+function SettingsView({
+  settings,
+  user,
+  db,
+  appId,
+  fixedExpenses,
+  incomeRules,
+}: SettingsViewProps) {
   const [localConfig, setLocalConfig] = useState<AppSettings>(settings);
   const isDirty = JSON.stringify(localConfig) !== JSON.stringify(settings);
-  useEffect(() => { if (!isDirty) setLocalConfig(settings); }, [settings, isDirty]);
 
-  const handleConfigChange = <K extends keyof AppSettings,>(k: K, v: AppSettings[K]) => setLocalConfig(p => ({ ...p, [k]: v }));
+  useEffect(() => {
+    if (!isDirty) {
+      setLocalConfig(settings);
+    }
+  }, [settings]);
+
+  const handleConfigChange = <K extends keyof AppSettings>(
+    key: K,
+    value: AppSettings[K]
+  ) => {
+    setLocalConfig(prev => ({
+      ...prev,
+      [key]: value,
+    }));
+  };
 
   const handleSaveGeneral = async () => {
     if (!user || !db) return;
@@ -1097,8 +1110,13 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }:
     handleConfigChange('defaultWorkDays', current.includes(dayIndex) ? current.filter(d => d !== dayIndex) : [...current, dayIndex].sort());
   };
 
-  const [newOverride, setNewOverride] = useState<WorkOverride>({ start: '', end: '', days: [1, 2, 3, 4, 5] });
-  const addOverride = (e: FormEvent<HTMLFormElement>) => {
+const [newOverride, setNewOverride] = useState<WorkOverride>({
+  start: '',
+  end: '',
+  days: [1, 2, 3, 4, 5],
+});
+
+const addOverride = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!newOverride.start || !newOverride.end) return;
     handleConfigChange('workOverrides', [...(localConfig.workOverrides || []), newOverride]);
@@ -1110,35 +1128,73 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }:
     handleConfigChange('workOverrides', overrides);
   };
 
-  const addRule = async (e: FormEvent<HTMLFormElement>, type: 'income' | 'expense') => {
-    e.preventDefault();
-    if (!user || !db) return;
-    const fd = new FormData(e.currentTarget);
-    const name = String(fd.get('name') ?? '').trim();
-    const amount = Number(fd.get('amount') ?? 0);
-    const frequency = String(fd.get('frequency') ?? 'daily') as Frequency;
-    const date = frequency === 'monthly' ? Number(fd.get('date') ?? 0) || null : null;
-    const workingDaysOnly = fd.get('workingDaysOnly') === 'on';
-    const createdAt = new Date().toISOString();
+const addRule = async (
+  e: FormEvent<HTMLFormElement>,
+  type: 'income' | 'expense'
+) => {
+  e.preventDefault();
 
-    if (type === 'income') {
-      const payload: Omit<IncomeRule, 'id'> = {
-        name, amount, frequency, date, workingDaysOnly,
-        category: String(fd.get('category') ?? DEFAULT_INCOME_CATEGORIES[0]),
-        createdAt,
-      };
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'incomeRules'), payload);
-    } else {
-      const payload: Omit<FixedExpense, 'id'> = {
-        name, amount, frequency, date, workingDaysOnly, createdAt,
-      };
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'fixedExpenses'), payload);
-    }
+  if (!user || !db) return;
 
-    e.currentTarget.reset();
-  };
+  const fd = new FormData(e.currentTarget);
 
-  const removeRule = async (id: string, type: 'income' | 'expense') => {
+  const name = String(fd.get('name') ?? '').trim();
+  const amount = Number(fd.get('amount') ?? 0);
+  const frequency = String(
+    fd.get('frequency') ?? 'daily'
+  ) as Frequency;
+
+  const date =
+    frequency === 'monthly'
+      ? Number(fd.get('date') ?? 0) || null
+      : null;
+
+  const workingDaysOnly =
+    fd.get('workingDaysOnly') === 'on';
+
+  const createdAt = new Date().toISOString();
+
+  const payload =
+    type === 'income'
+      ? {
+          name,
+          amount,
+          frequency,
+          date,
+          workingDaysOnly,
+          category: String(
+            fd.get('category') ?? DEFAULT_INCOME_CATEGORIES[0]
+          ),
+          createdAt,
+        }
+      : {
+          name,
+          amount,
+          frequency,
+          date,
+          workingDaysOnly,
+          createdAt,
+        };
+
+  await addDoc(
+    collection(
+      db,
+      'artifacts',
+      appId,
+      'users',
+      user.uid,
+      type === 'income' ? 'incomeRules' : 'fixedExpenses'
+    ),
+    payload
+  );
+
+  e.currentTarget.reset();
+};
+
+  const removeRule = async (
+  id: string,
+  type: 'income' | 'expense'
+) => {
     if (!user || !db) return;
     await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, type === 'income' ? 'incomeRules' : 'fixedExpenses', id));
   };
