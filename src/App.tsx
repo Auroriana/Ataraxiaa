@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
+import type { FormEvent } from 'react';
 import { 
   ChevronLeft, ChevronRight, Settings, Calendar as CalendarIcon, 
   Plus, Trash2, X, AlertTriangle, Download, PieChart as PieChartIcon, 
@@ -14,9 +15,61 @@ import { initializeApp } from 'firebase/app';
 import { 
   getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
 } from 'firebase/auth';
+import type { User } from 'firebase/auth';
 import { 
   getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, updateDoc, query
 } from 'firebase/firestore';
+import type { Firestore } from 'firebase/firestore';
+
+type Frequency = 'daily' | 'monthly';
+
+interface WorkOverride {
+  start: string;
+  end: string;
+  days: number[];
+}
+
+interface AppSettings {
+  cutoffs: number[];
+  defaultWorkDays: number[];
+  workOverrides: WorkOverride[];
+  healthThresholds: {
+    safe: number;
+    caution: number;
+    danger?: number;
+  };
+}
+
+interface FixedExpense {
+  id: string;
+  name: string;
+  amount: number | string;
+  frequency: Frequency;
+  date: number | string | null;
+  workingDaysOnly: boolean;
+  createdAt?: string;
+  category?: string;
+}
+
+interface IncomeRule {
+  id: string;
+  name: string;
+  amount: number | string;
+  frequency: Frequency;
+  date: number | string | null;
+  workingDaysOnly: boolean;
+  category: string;
+  createdAt?: string;
+}
+
+interface SettingsViewProps {
+  settings: AppSettings;
+  user: User | null;
+  db: Firestore | null;
+  appId: string;
+  fixedExpenses: FixedExpense[];
+  incomeRules: IncomeRule[];
+}
 
 const DEFAULT_EXPENSE_CATEGORIES = ['Food', 'Transport', 'Utilities', 'Entertainment', 'Shopping', 'Other'];
 const DEFAULT_INCOME_CATEGORIES = ['Salary', 'Freelance', 'Gift', 'Reimbursement', 'Investment', 'Other'];
@@ -993,7 +1046,9 @@ function InsightsView({ expenses, incomes, stats }) {
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie data={chartData} cx="50%" cy="50%" innerRadius={70} outerRadius={100} paddingAngle={4} dataKey="value">
-                  {chartData.map((e, i) => <Cell key={`cell-${i}`} fill={COLORS[i % COLORS.length]} />)}
+                  {chartData.map((_, i) => (
+						<Cell key={`cell-${i}`} fill={COLORS[i % COLORS.length]} />
+					))}
                 </Pie>
                 <RechartsTooltip formatter={(val) => formatPHP(val)} contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}/>
                 <Legend verticalAlign="bottom" height={36} iconType="circle"/>
@@ -1014,50 +1069,128 @@ function InsightsView({ expenses, incomes, stats }) {
   );
 }
 
-function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }) {
-  const [localConfig, setLocalConfig] = useState(settings);
-  useEffect(() => { if (!isDirty) setLocalConfig(settings); }, [settings]);
+function SettingsView({
+  settings,
+  user,
+  db,
+  appId,
+  fixedExpenses,
+  incomeRules,
+}: SettingsViewProps) {
+  const [localConfig, setLocalConfig] = useState<AppSettings>(settings);
   const isDirty = JSON.stringify(localConfig) !== JSON.stringify(settings);
 
-  const handleConfigChange = (k, v) => setLocalConfig(p => ({ ...p, [k]: v }));
+  useEffect(() => {
+    if (!isDirty) {
+      setLocalConfig(settings);
+    }
+  }, [settings]);
+
+  const handleConfigChange = <K extends keyof AppSettings>(
+    key: K,
+    value: AppSettings[K]
+  ) => {
+    setLocalConfig(prev => ({
+      ...prev,
+      [key]: value,
+    }));
+  };
 
   const handleSaveGeneral = async () => {
     if (!user || !db) return;
     await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), localConfig, { merge: true });
   };
 
-  const toggleWorkDay = (dayIndex) => {
+  const toggleWorkDay = (dayIndex: number) => {
     const current = localConfig.defaultWorkDays || [];
     handleConfigChange('defaultWorkDays', current.includes(dayIndex) ? current.filter(d => d !== dayIndex) : [...current, dayIndex].sort());
   };
 
-  const [newOverride, setNewOverride] = useState({ start: '', end: '', days: [1,2,3,4,5] });
-  const addOverride = (e) => {
+const [newOverride, setNewOverride] = useState<WorkOverride>({
+  start: '',
+  end: '',
+  days: [1, 2, 3, 4, 5],
+});
+
+const addOverride = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!newOverride.start || !newOverride.end) return;
     handleConfigChange('workOverrides', [...(localConfig.workOverrides || []), newOverride]);
     setNewOverride({ start: '', end: '', days: [1,2,3,4,5] });
   };
-  const removeOverride = (idx) => {
+  const removeOverride = (idx: number) => {
     const overrides = [...(localConfig.workOverrides || [])];
     overrides.splice(idx, 1);
     handleConfigChange('workOverrides', overrides);
   };
 
-  const addRule = async (e, type) => {
-    e.preventDefault();
-    if (!user || !db) return;
-    const fd = new FormData(e.target);
-    const payload = {
-      name: fd.get('name'), amount: parseFloat(fd.get('amount')), frequency: fd.get('frequency'),
-      date: fd.get('frequency') === 'monthly' ? parseInt(fd.get('date')) : null, workingDaysOnly: fd.get('workingDaysOnly') === 'on', createdAt: new Date().toISOString()
-    };
-    if (type === 'income') payload.category = fd.get('category') || DEFAULT_INCOME_CATEGORIES[0];
-    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, type === 'income' ? 'incomeRules' : 'fixedExpenses'), payload);
-    e.target.reset();
-  };
+const addRule = async (
+  e: FormEvent<HTMLFormElement>,
+  type: 'income' | 'expense'
+) => {
+  e.preventDefault();
 
-  const removeRule = async (id, type) => {
+  if (!user || !db) return;
+
+  const fd = new FormData(e.currentTarget);
+
+  const name = String(fd.get('name') ?? '').trim();
+  const amount = Number(fd.get('amount') ?? 0);
+  const frequency = String(
+    fd.get('frequency') ?? 'daily'
+  ) as Frequency;
+
+  const date =
+    frequency === 'monthly'
+      ? Number(fd.get('date') ?? 0) || null
+      : null;
+
+  const workingDaysOnly =
+    fd.get('workingDaysOnly') === 'on';
+
+  const createdAt = new Date().toISOString();
+
+  const payload =
+    type === 'income'
+      ? {
+          name,
+          amount,
+          frequency,
+          date,
+          workingDaysOnly,
+          category: String(
+            fd.get('category') ?? DEFAULT_INCOME_CATEGORIES[0]
+          ),
+          createdAt,
+        }
+      : {
+          name,
+          amount,
+          frequency,
+          date,
+          workingDaysOnly,
+          createdAt,
+        };
+
+  await addDoc(
+    collection(
+      db,
+      'artifacts',
+      appId,
+      'users',
+      user.uid,
+      type === 'income' ? 'incomeRules' : 'fixedExpenses'
+    ),
+    payload
+  );
+
+  e.currentTarget.reset();
+};
+
+  const removeRule = async (
+  id: string,
+  type: 'income' | 'expense'
+) => {
     if (!user || !db) return;
     await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, type === 'income' ? 'incomeRules' : 'fixedExpenses', id));
   };
