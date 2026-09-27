@@ -7,18 +7,22 @@ import {
   ArrowDownToLine, ArrowUpFromLine, HandCoins,
   History, Save, Target, CreditCard
 } from 'lucide-react';
+
 import { 
   PieChart, Pie, Cell, Tooltip as RechartsTooltip, 
   ResponsiveContainer, Legend 
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
+
 import { 
   getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
+
 import { 
   getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, updateDoc, query
 } from 'firebase/firestore';
+
 import type { Firestore } from 'firebase/firestore';
 
 type Frequency = 'daily' | 'monthly';
