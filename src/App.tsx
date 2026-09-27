@@ -3,12 +3,12 @@ import type { FormEvent } from 'react';
 import { 
   ChevronLeft, ChevronRight, Settings, Calendar as CalendarIcon, 
   Plus, Trash2, X, AlertTriangle, Download, PieChart as PieChartIcon, 
-  BarChart2, Briefcase, CalendarOff, CheckCircle2, Wallet, 
-  ArrowDownToLine, ArrowUpFromLine, RefreshCw, HandCoins,
-  History, Save, AlertCircle, Target, CreditCard, Filter
+  Briefcase, CalendarOff, CheckCircle2, Wallet, 
+  ArrowDownToLine, ArrowUpFromLine, HandCoins,
+  History, Save, Target, CreditCard
 } from 'lucide-react';
 import { 
-  PieChart, Pie, Cell, BarChart, Bar, XAxis, Tooltip as RechartsTooltip, 
+  PieChart, Pie, Cell, Tooltip as RechartsTooltip, 
   ResponsiveContainer, Legend 
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
