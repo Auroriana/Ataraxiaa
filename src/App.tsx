@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import type { Dispatch, FormEvent, ReactNode, SetStateAction } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { 
@@ -6,7 +6,7 @@ import {
   Plus, Trash2, X, AlertTriangle, Download, PieChart as PieChartIcon, 
   Briefcase, CalendarOff, CheckCircle2, Wallet, 
   ArrowDownToLine, ArrowUpFromLine, HandCoins,
-  History, Save, Target, CreditCard,
+  History, Save, Target, CreditCard, LogOut,
   TrendingUp, TrendingDown, Lightbulb, Info, Layers
 } from 'lucide-react';
 import { 
@@ -16,7 +16,8 @@ import {
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+  signInWithPopup, linkWithPopup, GoogleAuthProvider, signOut
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
 import { 
@@ -145,8 +146,6 @@ const DAYS_OF_WEEK = [
   { id: 6, short: 'Sat', long: 'Saturday' }
 ];
 
-// Budget warning levels, as a % of the cycle's earnings that is still available.
-// (Fixed here on purpose: older saved settings still contain the previous 50% / 20% values.)
 const CAUTION_PERCENT = 20;
 const DANGER_PERCENT = 10;
 
@@ -518,9 +517,13 @@ const app = Object.keys(firebaseConfig).length > 0 ? initializeApp(firebaseConfi
 const auth = app ? getAuth(app) : null;
 const db = app ? getFirestore(app) : null;
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const googleProvider = new GoogleAuthProvider();
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const autoAnonRef = useRef(true);
   const [activeTab, setActiveTab] = useState<Tab>('calendar'); // 'calendar', 'savings', 'insights', 'settings'
   
   const [settings, setSettings] = useState<AppSettings>({
@@ -549,20 +552,64 @@ export default function App() {
   const [showExpenses, setShowExpenses] = useState<boolean>(true);
 
   useEffect(() => {
-    if (!auth) return;
+    if (!auth) { setAuthLoading(false); return; }
+    
     const initAuth = async () => {
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
         }
       } catch (err) { console.error("Auth error:", err); }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
+
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      if (firebaseUser) {
+        setAuthLoading(false);
+        return;
+      }
+      if (autoAnonRef.current) {
+        signInAnonymously(auth)
+          .catch(err => console.error('Anonymous sign-in failed:', err))
+          .finally(() => setAuthLoading(false));
+      } else {
+        setAuthLoading(false);
+      }
+    });
     return () => unsubscribe();
   }, []);
+
+  const handleGoogleSignIn = async () => {
+    if (!auth) return;
+    autoAnonRef.current = true;
+    setAuthError(null);
+    try {
+      if (auth.currentUser?.isAnonymous) {
+        await linkWithPopup(auth.currentUser, googleProvider);
+      } else {
+        await signInWithPopup(auth, googleProvider);
+      }
+    } catch (err: any) {
+      if (err?.code === 'auth/credential-already-in-use') {
+        try {
+          await signInWithPopup(auth, googleProvider);
+        } catch (err2) {
+          console.error(err2);
+          setAuthError('Could not sign in with Google. Please try again.');
+        }
+      } else if (err?.code !== 'auth/popup-closed-by-user' && err?.code !== 'auth/cancelled-popup-request') {
+        console.error(err);
+        setAuthError('Could not sign in with Google. Please try again.');
+      }
+    }
+  };
+
+  const handleSignOut = async () => {
+    if (!auth) return;
+    autoAnonRef.current = false;
+    await signOut(auth);
+  };
 
   useEffect(() => {
     if (!user || !db) return;
@@ -634,35 +681,63 @@ export default function App() {
   const isViewingFutureCycle = viewedStartStr > todayStartStr;
   const daysLeft = isViewingCurrentCycle ? Math.max(1, daysBetween(toYYYYMMDD(new Date()), cycleStats.endStr) + 1) : 0;
 
-  if (!user && app) return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Loading Ataraxia...</div>;
+  if (authLoading) return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Loading Ataraxia...</div>;
+
+  if (!user && app) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-center p-6 gap-4">
+        <Briefcase className="w-10 h-10 text-emerald-500" />
+        <div>
+          <h1 className="text-xl font-bold text-gray-800">Ataraxia</h1>
+          <p className="text-sm text-gray-500 mt-1 max-w-xs">You're signed out. Sign in with Google to see your synced budget.</p>
+        </div>
+        {authError && <p className="text-sm text-red-600">{authError}</p>}
+        <button onClick={handleGoogleSignIn} className="flex items-center gap-2 bg-white border border-gray-300 shadow-sm px-4 py-2 rounded-lg font-semibold text-gray-700 hover:bg-gray-50 transition-colors">
+          <GoogleGIcon className="w-5 h-5" /> Continue with Google
+        </button>
+      </div>
+    );
+  }
 
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: THEME_STYLES }} />
       <div className={`theme-wrapper atx-container pb-20`} data-budget-state={cycleStats.healthState}>
         
-        {}
         <header className="atx-card border-b sticky top-0 z-10 shadow-sm">
           <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
             <h1 className="text-xl font-bold flex items-center gap-2">
               <Briefcase className="w-6 h-6 text-[var(--atx-accent)] transition-colors" /> Ataraxia
             </h1>
             
-            <div className="hidden sm:flex items-center gap-3">
-              <div className="bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100 flex items-center gap-2">
-                <CreditCard className="w-4 h-4 text-rose-500" />
-                <span className="text-xs font-bold text-rose-700">Debt: {formatPHP(globalDebtTotal)}</span>
+            <div className="flex items-center gap-2 sm:gap-3">
+              <div className="hidden sm:flex items-center gap-3">
+                <div className="bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100 flex items-center gap-2">
+                  <CreditCard className="w-4 h-4 text-rose-500" />
+                  <span className="text-xs font-bold text-rose-700">Debt: {formatPHP(globalDebtTotal)}</span>
+                </div>
               </div>
-            </div>
 
-            <div className="flex space-x-1 sm:space-x-2">
-              <NavButton icon={CalendarIcon} label="Dashboard" active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} />
-              <NavButton icon={Target} label="Savings" active={activeTab === 'savings'} onClick={() => setActiveTab('savings')} />
-              <NavButton icon={PieChartIcon} label="Insights" active={activeTab === 'insights'} onClick={() => setActiveTab('insights')} />
-              <NavButton icon={Settings} label="Config" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+              <AuthControl user={user} onSignIn={handleGoogleSignIn} onSignOut={handleSignOut} />
+
+              <div className="flex space-x-1 sm:space-x-2">
+                <NavButton icon={CalendarIcon} label="Dashboard" active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} />
+                <NavButton icon={Target} label="Savings" active={activeTab === 'savings'} onClick={() => setActiveTab('savings')} />
+                <NavButton icon={PieChartIcon} label="Insights" active={activeTab === 'insights'} onClick={() => setActiveTab('insights')} />
+                <NavButton icon={Settings} label="Config" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+              </div>
             </div>
           </div>
         </header>
+
+        {authError && (
+          <div className="max-w-5xl mx-auto px-4 pt-3">
+            <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded-lg flex items-center justify-between gap-3">
+              <span>{authError}</span>
+              <button onClick={() => setAuthError(null)} className="text-red-400 hover:text-red-600 shrink-0"><X className="w-4 h-4"/></button>
+            </div>
+          </div>
+        )}
 
         <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
           {activeTab === 'calendar' && (
@@ -2215,6 +2290,44 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules, e
         </div>
         <button onClick={handleExport} className="bg-gray-900 text-white px-4 py-2 rounded-lg font-bold hover:bg-gray-800 transition-all flex items-center justify-center gap-2"><Download className="w-4 h-4" /> CSV</button>
       </section>
+    </div>
+  );
+}
+
+function GoogleGIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 48 48" className={className} aria-hidden="true">
+      <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"/>
+      <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z"/>
+      <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z"/>
+      <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z"/>
+    </svg>
+  );
+}
+
+function AuthControl({ user, onSignIn, onSignOut }: { user: User | null; onSignIn: () => void; onSignOut: () => void; }) {
+  if (!user || user.isAnonymous) {
+    return (
+      <button onClick={onSignIn} className="flex items-center gap-2 text-sm font-semibold text-gray-600 hover:bg-gray-100 border border-gray-200 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors">
+        <GoogleGIcon className="w-4 h-4" />
+        <span className="hidden sm:inline">Sign in with Google</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      {user.photoURL ? (
+        <img src={user.photoURL} alt={user.displayName || 'Account'} referrerPolicy="no-referrer" className="w-7 h-7 rounded-full border border-gray-200" />
+      ) : (
+        <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center text-xs font-bold text-gray-600">
+          {(user.displayName || user.email || '?').charAt(0).toUpperCase()}
+        </div>
+      )}
+      <span className="hidden md:inline text-sm font-semibold text-gray-700 max-w-[120px] truncate">{user.displayName || user.email}</span>
+      <button onClick={onSignOut} title="Sign out" className="text-gray-400 hover:text-red-500 p-1.5 rounded-lg hover:bg-gray-100 transition-colors">
+        <LogOut className="w-4 h-4" />
+      </button>
     </div>
   );
 }
