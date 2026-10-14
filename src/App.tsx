@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import type { Dispatch, FormEvent, ReactNode, SetStateAction } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { 
@@ -6,16 +6,17 @@ import {
   Plus, Trash2, X, AlertTriangle, Download, PieChart as PieChartIcon, 
   Briefcase, CalendarOff, CheckCircle2, Wallet, 
   ArrowDownToLine, ArrowUpFromLine, HandCoins,
-  History, Save, Target, CreditCard, LogOut
+  History, Save, Target, CreditCard,
+  TrendingUp, TrendingDown, Lightbulb, Info, Layers
 } from 'lucide-react';
 import { 
   PieChart, Pie, Cell, Tooltip as RechartsTooltip, 
-  ResponsiveContainer, Legend 
+  ResponsiveContainer, Legend,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, AreaChart, Area, ReferenceLine
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, onAuthStateChanged, signInAnonymously, 
-  signInWithPopup, linkWithPopup, GoogleAuthProvider, signOut 
+  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
 import { 
@@ -23,10 +24,17 @@ import {
 } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
+declare const __firebase_config: string | undefined;
+declare const __app_id: string | undefined;
+declare const __initial_auth_token: string | undefined;
+
 type Frequency = 'daily' | 'monthly';
 type Tab = 'calendar' | 'savings' | 'insights' | 'settings';
 type LinkedType = 'goal' | 'debt' | null;
 type ExceptionType = 'absent' | 'expense_skip' | 'income_skip';
+type InsightRange = 'cycle' | '1m' | '3m' | '6m' | '1y' | 'all';
+type InsightTone = 'good' | 'warn' | 'bad' | 'info';
+type HealthState = 'safe' | 'caution' | 'danger';
 
 interface WorkOverride { start: string; end: string; days: number[]; }
 interface AppSettings {
@@ -40,20 +48,59 @@ interface IncomeRule { id: string; name: string; amount: number | string; freque
 interface ExceptionEntry { id: string; date: string; type: ExceptionType; targetId: string | null; }
 interface SavingsGoal { id: string; name: string; targetAmount: number | string; createdAt?: string; }
 interface Debt { id: string; name: string; initialAmount: number | string; createdAt?: string; }
-interface CycleStats { expectedIncome: number; cycleReceivedIncome: number; cycleFixed: number; cycleManualExpenses: number; totalExpenses: number; availableReality: number; healthPercent: number; healthState: 'safe' | 'caution' | 'danger'; startStr: string; endStr: string; }
+
+// One line of the unified money ledger (a logged record or a scheduled occurrence).
+interface LedgerEntry {
+  date: string; kind: 'income' | 'expense'; amount: number; category: string; label: string;
+  source: 'manual' | 'scheduled';
+  received: boolean; // income: money actually in hand. Expenses are always "received" (spent/committed).
+  linkedType: LinkedType;
+}
+// Everything we know about one pay cycle, including what was carried in from the cycle before it.
+interface CycleRow {
+  index: number; startStr: string; endStr: string;
+  carryIn: number;
+  receivedIncome: number; pendingIncome: number; expectedIncome: number;
+  scheduledExpenses: number; manualExpenses: number; totalExpenses: number;
+  closingActual: number; closingProjected: number;
+  available: number; // what the dashboard shows as Available (actual for past/current, projected for future)
+  isCurrent: boolean; isFuture: boolean; projectionDepth: number;
+  entries: LedgerEntry[];
+}
+interface CycleStats {
+  startStr: string; endStr: string; carryIn: number;
+  expectedIncome: number; cycleReceivedIncome: number; pendingIncome: number;
+  cycleFixed: number; cycleManualExpenses: number; totalExpenses: number;
+  availableReality: number; healthPercent: number; healthState: HealthState;
+  isProjection: boolean; projectionDepth: number;
+}
+interface ScheduleContext {
+  settings: AppSettings;
+  ruleStarts: Record<string, string>; // rule id -> first date the rule applies (start of the cycle it was created in)
+  skips: Set<string>;
+  absences: Set<string>;
+}
+interface LedgerSources { expenses: Expense[]; incomes: Income[]; fixedExpenses: FixedExpense[]; incomeRules: IncomeRule[]; }
+interface DayFlows { scheduledExpense: number; loggedExpense: number; scheduledIncome: number; loggedIncome: number; pendingIncome: number; hasLoggedExpense: boolean; }
+type GoalWithProgress = SavingsGoal & { saved: number; pct: number };
+
 interface NavButtonProps { icon: LucideIcon; label: string; active: boolean; onClick: () => void; }
-interface StatsHeaderProps { stats: CycleStats; isCurrent: boolean; }
-interface StatCardProps { title: string; value: number; icon: ReactNode; className?: string; highlight?: boolean; }
+interface StatsHeaderProps { stats: CycleStats; isCurrent: boolean; missedIncome: number; daysLeft: number; }
+interface StatCardProps { title: string; value: number; icon: ReactNode; className?: string; highlight?: boolean; sub?: string; signed?: boolean; }
 interface MergedCalendarViewProps {
-  calendarMonth: Date; setCalendarMonth: Dispatch<SetStateAction<Date>>; settings: AppSettings;
-  expenses: Expense[]; fixedExpenses: FixedExpense[]; incomes: Income[]; incomeRules: IncomeRule[]; exceptions: ExceptionEntry[];
+  calendarMonth: Date; setCalendarMonth: Dispatch<SetStateAction<Date>>; schedule: ScheduleContext;
+  expenses: Expense[]; fixedExpenses: FixedExpense[]; incomes: Income[]; incomeRules: IncomeRule[];
   viewedStart: string; viewedEnd: string; todayStart: string; todayEnd: string; openDayModal: (date: string) => void;
   showIncome: boolean; setShowIncome: Dispatch<SetStateAction<boolean>>; showExpenses: boolean; setShowExpenses: Dispatch<SetStateAction<boolean>>;
 }
-interface SavingsDebtViewProps { user: User | null; db: Firestore | null; appId: string; savingsGoals: SavingsGoal[]; debts: Debt[]; expenses: Expense[]; }
+interface SavingsDebtViewProps {
+  user: User | null; db: Firestore | null; appId: string; savingsGoals: SavingsGoal[]; debts: Debt[]; expenses: Expense[];
+  cycles: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number;
+}
+interface SplitPlannerProps { goals: GoalWithProgress[]; cycles: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number; }
 interface DayDetailsModalProps {
   isOpen: boolean; onClose: () => void; dateStr: string | null; expenses: Expense[]; fixedExpenses: FixedExpense[];
-  incomes: Income[]; incomeRules: IncomeRule[]; exceptions: ExceptionEntry[]; settings: AppSettings;
+  incomes: Income[]; incomeRules: IncomeRule[]; exceptions: ExceptionEntry[]; schedule: ScheduleContext;
   savingsGoals: SavingsGoal[]; debts: Debt[]; user: User | null; db: Firestore | null; appId: string;
 }
 type ConfirmData =
@@ -64,8 +111,27 @@ type ConfirmData =
 type ConfirmVariant = 'danger' | 'warning' | 'primary';
 interface ConfirmDetails { title: string; message: string; confirmText: string; variant: ConfirmVariant; }
 interface ConfirmModalProps { isOpen: boolean; title: string; message: string; onConfirm: () => void | Promise<void>; onCancel: () => void; confirmText?: string; variant?: ConfirmVariant; }
-interface InsightsViewProps { expenses: Expense[]; incomes: Income[]; stats: CycleStats; }
-interface SettingsViewProps { settings: AppSettings; user: User | null; db: Firestore | null; appId: string; fixedExpenses: FixedExpense[]; incomeRules: IncomeRule[]; }
+interface InsightsViewProps { cycles: CycleRow[]; viewedStartStr: string; cyclesPerMonth: number; }
+interface SettingsViewProps {
+  settings: AppSettings; user: User | null; db: Firestore | null; appId: string;
+  fixedExpenses: FixedExpense[]; incomeRules: IncomeRule[]; expenses: Expense[]; incomes: Income[];
+}
+
+interface NamedAmount { name: string; value: number; }
+interface TopItem extends NamedAmount { count: number; }
+interface WeekdayStat { day: string; avg: number; total: number; }
+interface CycleSeriesPoint { label: string; fullLabel: string; carryIn: number; income: number; spent: number; scheduled: number; logged: number; net: number; balance: number; status: string; }
+interface ReportInsight { tone: InsightTone; title: string; text: string; }
+interface ReportData {
+  rows: CycleRow[]; startStr: string; endStr: string; asOf: string; days: number; includesCurrent: boolean;
+  closingBalance: number; balanceLabel: string;
+  income: number; pendingIncome: number; spent: number; scheduledSpent: number; loggedSpent: number;
+  net: number; savingsRate: number | null; avgCycleIncome: number; avgCycleSpent: number; avgDaily: number;
+  goalContrib: number; debtPaid: number;
+  expenseCats: NamedAmount[]; incomeCats: NamedAmount[]; topItems: TopItem[]; weekday: WeekdayStat[];
+  series: CycleSeriesPoint[]; prev: { income: number; spent: number } | null;
+  insights: ReportInsight[];
+}
 
 const DEFAULT_EXPENSE_CATEGORIES = ['Food', 'Transport', 'Utilities', 'Entertainment', 'Shopping', 'Other'];
 const DEFAULT_INCOME_CATEGORIES = ['Salary', 'Freelance', 'Gift', 'Reimbursement', 'Investment', 'Other'];
@@ -78,6 +144,22 @@ const DAYS_OF_WEEK = [
   { id: 5, short: 'Fri', long: 'Friday' },
   { id: 6, short: 'Sat', long: 'Saturday' }
 ];
+
+// Budget warning levels, as a % of the cycle's earnings that is still available.
+// (Fixed here on purpose: older saved settings still contain the previous 50% / 20% values.)
+const CAUTION_PERCENT = 20;
+const DANGER_PERCENT = 10;
+
+const CHART_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#64748b', '#ec4899', '#14b8a6', '#f97316', '#84cc16'];
+const RANGE_OPTIONS: { id: InsightRange; label: string }[] = [
+  { id: 'cycle', label: 'Viewed Cycle' },
+  { id: '1m', label: '1 Month' },
+  { id: '3m', label: '3 Months' },
+  { id: '6m', label: '6 Months' },
+  { id: '1y', label: '1 Year' },
+  { id: 'all', label: 'All Time' },
+];
+
 
 const THEME_STYLES = `
   :root {
@@ -146,6 +228,32 @@ const toYYYYMMDD = (date: Date) => {
   return `${y}-${m}-${d}`;
 };
 
+// ---------------------------------------------------------------------------
+// Date + number helpers
+// ---------------------------------------------------------------------------
+const parseYMD = (s: string) => {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+};
+const addDays = (date: Date, n: number) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + n);
+const daysBetween = (fromStr: string, toStr: string) => Math.round((parseYMD(toStr).getTime() - parseYMD(fromStr).getTime()) / 86400000);
+const num = (v: unknown) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const shortDate = (s: string) => parseYMD(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+const longDate = (s: string) => parseYMD(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+const compactPHP = (v: number) => {
+  const abs = Math.abs(v);
+  const sign = v < 0 ? '-' : '';
+  if (abs >= 1000000) return `${sign}${(abs / 1000000).toFixed(1)}M`;
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(abs % 1000 === 0 ? 0 : 1)}k`;
+  return `${sign}${Math.round(abs)}`;
+};
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+const formatMonths = (m: number) => {
+  const text = Number.isInteger(m) ? String(m) : m.toFixed(1);
+  return `${text} ${m === 1 ? 'month' : 'months'}`;
+};
+
 const getActivePeriod = (targetDate: Date, cutoffs: number[] = [13, 29]) => {
   if (!cutoffs || cutoffs.length === 0) cutoffs = [13, 29];
   const d = new Date(targetDate);
@@ -174,12 +282,12 @@ const getActivePeriod = (targetDate: Date, cutoffs: number[] = [13, 29]) => {
   const targetTime = new Date(year, month, d.getDate()).getTime();
   
   let start = candidates[0];
-  let end = candidates[1];
+  let end = addDays(candidates[1], -1);
 
   for (let i = 0; i < candidates.length - 1; i++) {
     if (targetTime >= candidates[i].getTime() && targetTime < candidates[i+1].getTime()) {
        start = candidates[i];
-       end = new Date(candidates[i+1].getTime() - 86400000); 
+       end = addDays(candidates[i+1], -1);
        break;
     }
   }
@@ -195,40 +303,224 @@ const getBaseWorkDay = (dateStr: string, dateObj: Date, settings: AppSettings) =
   return defaultPattern.includes(dateObj.getDay());
 };
 
-const isAbsent = (dateStr: string, exceptions: ExceptionEntry[]) => {
-  return exceptions.some(e => e.date === dateStr && e.type === 'absent');
+// ---------------------------------------------------------------------------
+// Scheduled rules (fixed expenses + recurring income)
+// ---------------------------------------------------------------------------
+type ScheduledRule = FixedExpense | IncomeRule;
+
+const skipKey = (type: ExceptionType, targetId: string | null, date: string) => `${type}|${targetId ?? ''}|${date}`;
+
+const makeSchedule = (settings: AppSettings, fixedExpenses: FixedExpense[], incomeRules: IncomeRule[], exceptions: ExceptionEntry[]): ScheduleContext => {
+  const ruleStarts: Record<string, string> = {};
+  const allRules: ScheduledRule[] = [...fixedExpenses, ...incomeRules];
+  allRules.forEach(rule => {
+    if (!rule.createdAt) return;
+    const created = new Date(rule.createdAt);
+    if (isNaN(created.getTime())) return;
+    // A rule counts for the whole cycle it was created in, but not for earlier cycles.
+    ruleStarts[rule.id] = toYYYYMMDD(getActivePeriod(created, settings.cutoffs).start);
+  });
+  const skips = new Set<string>();
+  const absences = new Set<string>();
+  exceptions.forEach(ex => {
+    if (ex.type === 'absent') absences.add(ex.date);
+    else skips.add(skipKey(ex.type, ex.targetId, ex.date));
+  });
+  return { settings, ruleStarts, skips, absences };
 };
 
-// Firebase project credentials come from environment variables (set these in
-// a .env file - see the accompanying .env.example) instead of being baked in,
-// so real keys never get committed to source control.
-const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+const isWorkingDay = (sc: ScheduleContext, dateStr: string, dateObj: Date) =>
+  getBaseWorkDay(dateStr, dateObj, sc.settings) && !sc.absences.has(dateStr);
+
+// A monthly rule on the 29th/30th/31st lands on the last day of shorter months instead of being skipped.
+const ruleHitsDay = (frequency: Frequency, ruleDate: number | string | null, d: Date) => {
+  if (frequency === 'daily') return true;
+  const day = Number(ruleDate);
+  if (!day) return false;
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  return d.getDate() === Math.min(day, lastDay);
 };
 
-const firebaseReady = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
-const app = firebaseReady ? initializeApp(firebaseConfig) : null;
+// Is the rule due on this date at all (ignoring skips and absences)? Used to list it in the day view.
+const ruleScheduledOn = (sc: ScheduleContext, rule: ScheduledRule, dateStr: string, d: Date) => {
+  const start = sc.ruleStarts[rule.id];
+  if (start && dateStr < start) return false;
+  return ruleHitsDay(rule.frequency, rule.date, d);
+};
+
+// Is the rule actually in effect on this date (not skipped, and the work-day requirement is met)?
+const ruleLiveOn = (sc: ScheduleContext, rule: ScheduledRule, dateStr: string, d: Date, skipType: ExceptionType) => {
+  if (!ruleScheduledOn(sc, rule, dateStr, d)) return false;
+  if (sc.skips.has(skipKey(skipType, rule.id, dateStr))) return false;
+  if (rule.workingDaysOnly && !isWorkingDay(sc, dateStr, d)) return false;
+  return true;
+};
+
+// ---------------------------------------------------------------------------
+// Ledger + cycle engine (single source of truth for every number on screen)
+// ---------------------------------------------------------------------------
+const buildCycleEntries = (startStr: string, endStr: string, sc: ScheduleContext, src: LedgerSources, receivedRuleDays: Set<string>): LedgerEntry[] => {
+  const entries: LedgerEntry[] = [];
+
+  for (let d = parseYMD(startStr); toYYYYMMDD(d) <= endStr; d = addDays(d, 1)) {
+    const ds = toYYYYMMDD(d);
+    src.fixedExpenses.forEach(exp => {
+      if (!ruleLiveOn(sc, exp, ds, d, 'expense_skip')) return;
+      entries.push({ date: ds, kind: 'expense', amount: num(exp.amount), category: exp.category || exp.name || 'Scheduled', label: exp.name, source: 'scheduled', received: true, linkedType: null });
+    });
+    src.incomeRules.forEach(inc => {
+      if (!ruleLiveOn(sc, inc, ds, d, 'income_skip')) return;
+      // Once marked received, the received record represents it. Don't count it twice.
+      if (receivedRuleDays.has(`${inc.id}|${ds}`)) return;
+      entries.push({ date: ds, kind: 'income', amount: num(inc.amount), category: inc.category || 'Other', label: inc.name, source: 'scheduled', received: false, linkedType: null });
+    });
+  }
+
+  src.incomes.forEach(i => {
+    if (i.date < startStr || i.date > endStr) return;
+    entries.push({ date: i.date, kind: 'income', amount: num(i.amount), category: i.category || 'Other', label: i.name || i.description || 'Income', source: i.ruleId ? 'scheduled' : 'manual', received: i.isReceived !== false, linkedType: null });
+  });
+  src.expenses.forEach(e => {
+    if (e.date < startStr || e.date > endStr) return;
+    entries.push({ date: e.date, kind: 'expense', amount: num(e.amount), category: e.category || 'Other', label: e.description || e.name || 'Expense', source: 'manual', received: true, linkedType: e.linkedType ?? null });
+  });
+
+  return entries;
+};
+
+const emptyRow = (startStr: string, endStr: string): CycleRow => ({
+  index: 0, startStr, endStr, carryIn: 0, receivedIncome: 0, pendingIncome: 0, expectedIncome: 0,
+  scheduledExpenses: 0, manualExpenses: 0, totalExpenses: 0, closingActual: 0, closingProjected: 0, available: 0,
+  isCurrent: false, isFuture: false, projectionDepth: 0, entries: []
+});
+
+/**
+ * Builds every cycle from the first one with any data up to the later of (today's cycle, the viewed cycle).
+ *
+ *  - Past + current cycles:  Available = Carried Over + Received income - Total spent
+ *    and the cycle's leftover (positive or negative) becomes the next cycle's Carried Over.
+ *  - The cycle right after today's:  Carried Over = today's Available (what you have if you stop spending now).
+ *  - Cycles further ahead:  Carried Over = the previous cycle's projected balance (Expected income - Spent).
+ */
+const buildCycles = (src: LedgerSources, sc: ScheduleContext, todayStartStr: string, viewedStartStr: string): CycleRow[] => {
+  const cutoffs = sc.settings.cutoffs;
+
+  const dates: string[] = [];
+  src.expenses.forEach(e => { if (e.date) dates.push(e.date); });
+  src.incomes.forEach(i => { if (i.date) dates.push(i.date); });
+  Object.values(sc.ruleStarts).forEach(s => dates.push(s));
+
+  let firstStart = todayStartStr;
+  if (dates.length > 0) {
+    const earliest = dates.reduce((a, b) => (a < b ? a : b));
+    firstStart = toYYYYMMDD(getActivePeriod(parseYMD(earliest), cutoffs).start);
+  }
+  const chainStart = [firstStart, todayStartStr, viewedStartStr].reduce((a, b) => (a < b ? a : b));
+  const chainEnd = todayStartStr > viewedStartStr ? todayStartStr : viewedStartStr;
+
+  const receivedRuleDays = new Set<string>();
+  src.incomes.forEach(i => { if (i.ruleId && i.isReceived !== false) receivedRuleDays.add(`${i.ruleId}|${i.date}`); });
+
+  const rows: CycleRow[] = [];
+  let anchor = parseYMD(chainStart);
+  for (let guard = 0; guard < 1500; guard++) {
+    const p = getActivePeriod(anchor, cutoffs);
+    const startStr = toYYYYMMDD(p.start);
+    if (startStr > chainEnd) break;
+    const endStr = toYYYYMMDD(p.end);
+
+    const entries = buildCycleEntries(startStr, endStr, sc, src, receivedRuleDays);
+    const row = emptyRow(startStr, endStr);
+    row.index = rows.length;
+    row.entries = entries;
+    entries.forEach(e => {
+      if (e.kind === 'income') {
+        if (e.received) row.receivedIncome += e.amount; else row.pendingIncome += e.amount;
+      } else if (e.source === 'scheduled') row.scheduledExpenses += e.amount;
+      else row.manualExpenses += e.amount;
+    });
+    row.receivedIncome = round2(row.receivedIncome);
+    row.pendingIncome = round2(row.pendingIncome);
+    row.expectedIncome = round2(row.receivedIncome + row.pendingIncome);
+    row.scheduledExpenses = round2(row.scheduledExpenses);
+    row.manualExpenses = round2(row.manualExpenses);
+    row.totalExpenses = round2(row.scheduledExpenses + row.manualExpenses);
+    rows.push(row);
+
+    anchor = addDays(p.end, 1);
+  }
+
+  const foundCurrent = rows.findIndex(r => r.startStr === todayStartStr);
+  const curIdx = foundCurrent >= 0 ? foundCurrent : rows.length - 1;
+
+  rows.forEach((row, i) => {
+    const prev = i > 0 ? rows[i - 1] : null;
+    row.carryIn = prev === null ? 0 : (i <= curIdx + 1 ? prev.closingActual : prev.closingProjected);
+    row.closingActual = round2(row.carryIn + row.receivedIncome - row.totalExpenses);
+    row.closingProjected = round2(row.carryIn + row.expectedIncome - row.totalExpenses);
+    row.isCurrent = i === curIdx;
+    row.isFuture = i > curIdx;
+    row.projectionDepth = i > curIdx ? i - curIdx : 0;
+    row.available = row.isFuture ? row.closingProjected : row.closingActual;
+  });
+
+  return rows;
+};
+
+// Budget status = what's left (Available, including carry-over) as a share of this cycle's own earnings.
+const evaluateHealth = (available: number, earnings: number): { percent: number; state: HealthState } => {
+  const percent = earnings > 0 ? (available / earnings) * 100 : 0;
+  if (available < 0) return { percent, state: 'danger' };
+  if (earnings <= 0) return { percent, state: 'safe' };
+  if (percent < DANGER_PERCENT) return { percent, state: 'danger' };
+  if (percent < CAUTION_PERCENT) return { percent, state: 'caution' };
+  return { percent, state: 'safe' };
+};
+
+const rowToStats = (row: CycleRow): CycleStats => {
+  const health = evaluateHealth(row.available, row.expectedIncome);
+  return {
+    startStr: row.startStr, endStr: row.endStr, carryIn: row.carryIn,
+    expectedIncome: row.expectedIncome, cycleReceivedIncome: row.receivedIncome, pendingIncome: row.pendingIncome,
+    cycleFixed: row.scheduledExpenses, cycleManualExpenses: row.manualExpenses, totalExpenses: row.totalExpenses,
+    availableReality: row.available, healthPercent: health.percent, healthState: health.state,
+    isProjection: row.isFuture, projectionDepth: row.projectionDepth
+  };
+};
+
+// Totals for one calendar day, matching exactly what the cycle engine counts.
+const getDayFlows = (sc: ScheduleContext, fixedExpenses: FixedExpense[], incomeRules: IncomeRule[], expenses: Expense[], incomes: Income[], dateStr: string, d: Date): DayFlows => {
+  const flows: DayFlows = { scheduledExpense: 0, loggedExpense: 0, scheduledIncome: 0, loggedIncome: 0, pendingIncome: 0, hasLoggedExpense: false };
+  fixedExpenses.forEach(exp => {
+    if (ruleLiveOn(sc, exp, dateStr, d, 'expense_skip')) flows.scheduledExpense += num(exp.amount);
+  });
+  expenses.forEach(e => {
+    if (e.date !== dateStr) return;
+    flows.loggedExpense += num(e.amount);
+    flows.hasLoggedExpense = true;
+  });
+  const dayIncomes = incomes.filter(i => i.date === dateStr);
+  incomeRules.forEach(inc => {
+    if (!ruleLiveOn(sc, inc, dateStr, d, 'income_skip')) return;
+    if (dayIncomes.some(i => i.ruleId === inc.id && i.isReceived !== false)) return;
+    flows.scheduledIncome += num(inc.amount);
+    flows.pendingIncome += num(inc.amount);
+  });
+  dayIncomes.forEach(i => {
+    flows.loggedIncome += num(i.amount);
+    if (i.isReceived === false) flows.pendingIncome += num(i.amount);
+  });
+  return flows;
+};
+
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = Object.keys(firebaseConfig).length > 0 ? initializeApp(firebaseConfig) : null;
 const auth = app ? getAuth(app) : null;
 const db = app ? getFirestore(app) : null;
-const googleProvider = new GoogleAuthProvider();
-
-// Namespace for this app's data inside Firestore: artifacts/{appId}/users/{uid}/...
-// This is just a fixed label and unrelated to the Firebase "appId" above.
-const appId = 'ataraxia';
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [authError, setAuthError] = useState<string | null>(null);
-  // Whether losing the session should auto-start a fresh anonymous one.
-  // Turned off right before an explicit sign-out so we don't silently spin
-  // up a brand-new empty account the instant someone signs out of Google.
-  const autoAnonRef = useRef(true);
   const [activeTab, setActiveTab] = useState<Tab>('calendar'); // 'calendar', 'savings', 'insights', 'settings'
   
   const [settings, setSettings] = useState<AppSettings>({
@@ -257,58 +549,20 @@ export default function App() {
   const [showExpenses, setShowExpenses] = useState<boolean>(true);
 
   useEffect(() => {
-    if (!auth) { setAuthLoading(false); return; }
-    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-      setUser(firebaseUser);
-      if (firebaseUser) {
-        setAuthLoading(false);
-        return;
-      }
-      if (autoAnonRef.current) {
-        signInAnonymously(auth)
-          .catch(err => console.error('Anonymous sign-in failed:', err))
-          .finally(() => setAuthLoading(false));
-      } else {
-        setAuthLoading(false);
-      }
-    });
+    if (!auth) return;
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { console.error("Auth error:", err); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
     return () => unsubscribe();
   }, []);
-
-  const handleGoogleSignIn = async () => {
-    if (!auth) return;
-    autoAnonRef.current = true;
-    setAuthError(null);
-    try {
-      if (auth.currentUser?.isAnonymous) {
-        // Upgrade the current anonymous account so today's local data carries
-        // over, instead of starting a separate, empty Google-linked account.
-        await linkWithPopup(auth.currentUser, googleProvider);
-      } else {
-        await signInWithPopup(auth, googleProvider);
-      }
-    } catch (err: any) {
-      if (err?.code === 'auth/credential-already-in-use') {
-        // This Google account already has its own saved data from another
-        // device or session - switch to that account instead of the local one.
-        try {
-          await signInWithPopup(auth, googleProvider);
-        } catch (err2) {
-          console.error(err2);
-          setAuthError('Could not sign in with Google. Please try again.');
-        }
-      } else if (err?.code !== 'auth/popup-closed-by-user' && err?.code !== 'auth/cancelled-popup-request') {
-        console.error(err);
-        setAuthError('Could not sign in with Google. Please try again.');
-      }
-    }
-  };
-
-  const handleSignOut = async () => {
-    if (!auth) return;
-    autoAnonRef.current = false;
-    await signOut(auth);
-  };
 
   useEffect(() => {
     if (!user || !db) return;
@@ -332,57 +586,27 @@ export default function App() {
 
   const todayCycle = useMemo(() => getActivePeriod(new Date(), settings.cutoffs), [settings.cutoffs]);
   const viewedCycle = useMemo(() => getActivePeriod(viewedCycleAnchor, settings.cutoffs), [viewedCycleAnchor, settings.cutoffs]);
+  const todayStartStr = toYYYYMMDD(todayCycle.start);
+  const viewedStartStr = toYYYYMMDD(viewedCycle.start);
+  const cyclesPerMonth = Math.max(1, new Set(settings.cutoffs && settings.cutoffs.length > 0 ? settings.cutoffs : [13, 29]).size);
 
-  const cycleStats = useMemo(() => {
-    const startStr = toYYYYMMDD(viewedCycle.start);
-    const endStr = toYYYYMMDD(viewedCycle.end);
-    
-    let expectedIncome = 0;
-    let cycleFixed = 0;
-    let currDate = new Date(viewedCycle.start);
-    const endDate = new Date(viewedCycle.end);
-    
-    while(currDate <= endDate) {
-      const currStr = toYYYYMMDD(currDate);
-      const isActualWorkDay = getBaseWorkDay(currStr, currDate, settings) && !isAbsent(currStr, exceptions);
-      
-      fixedExpenses.forEach(exp => {
-        if (exceptions.some(ex => ex.date === currStr && ex.targetId === exp.id && ex.type === 'expense_skip')) return;
-        if (exp.workingDaysOnly && !isActualWorkDay) return;
-        if (exp.frequency === 'daily' || (exp.frequency === 'monthly' && Number(exp.date) === currDate.getDate())) {
-          cycleFixed += Number(exp.amount);
-        }
-      });
+  // Every number on the dashboard, savings planner and insights comes from this one chain of cycles.
+  const schedule = useMemo(() => makeSchedule(settings, fixedExpenses, incomeRules, exceptions), [settings, fixedExpenses, incomeRules, exceptions]);
+  const cycles = useMemo(
+    () => buildCycles({ expenses, incomes, fixedExpenses, incomeRules }, schedule, todayStartStr, viewedStartStr),
+    [expenses, incomes, fixedExpenses, incomeRules, schedule, todayStartStr, viewedStartStr]
+  );
+  const viewedRow = cycles.find(c => c.startStr === viewedStartStr);
+  const cycleStats = useMemo(
+    () => rowToStats(viewedRow ?? emptyRow(viewedStartStr, toYYYYMMDD(viewedCycle.end))),
+    [viewedRow, viewedStartStr, viewedCycle]
+  );
 
-      incomeRules.forEach(inc => {
-        if (exceptions.some(ex => ex.date === currStr && ex.targetId === inc.id && ex.type === 'income_skip')) return;
-        if (inc.workingDaysOnly && !isActualWorkDay) return;
-        if (inc.frequency === 'daily' || (inc.frequency === 'monthly' && Number(inc.date) === currDate.getDate())) {
-          expectedIncome += Number(inc.amount);
-        }
-      });
-
-      currDate.setDate(currDate.getDate() + 1);
-    }
-
-    let cycleManualExpenses = expenses.filter(e => e.date >= startStr && e.date <= endStr).reduce((sum, e) => sum + Number(e.amount), 0);
-    let cycleReceivedIncome = incomes.filter(i => i.date >= startStr && i.date <= endStr).reduce((sum, i) => sum + Number(i.amount), 0);
-    let manualExpected = incomes.filter(i => !i.isReceived && i.date >= startStr && i.date <= endStr).reduce((sum, i) => sum + Number(i.amount), 0);
-    expectedIncome += manualExpected;
-
-    const totalExpenses = cycleFixed + cycleManualExpenses;
-    const availableReality = cycleReceivedIncome - totalExpenses;
-    const healthPercent = expectedIncome > 0 ? (availableReality / expectedIncome) * 100 : 0;
-    
-    let healthState: CycleStats['healthState'] = 'safe';
-    if (healthPercent <= (settings.healthThresholds?.danger || 20) || availableReality < 0) healthState = 'danger';
-    else if (healthPercent <= (settings.healthThresholds?.caution || 50)) healthState = 'caution';
-
-    return { 
-      expectedIncome, cycleReceivedIncome, cycleFixed, cycleManualExpenses, 
-      totalExpenses, availableReality, healthPercent, healthState, startStr, endStr 
-    };
-  }, [settings, expenses, fixedExpenses, incomeRules, incomes, exceptions, viewedCycle]);
+  // Scheduled income from finished cycles that was never marked as received (so it isn't in the carry-over).
+  const missedIncome = useMemo(
+    () => round2(cycles.filter(c => !c.isCurrent && !c.isFuture).reduce((sum, c) => sum + c.pendingIncome, 0)),
+    [cycles]
+  );
 
   const globalDebtTotal = useMemo(() => {
     return debts.reduce((total, debt) => {
@@ -393,12 +617,12 @@ export default function App() {
   }, [debts, expenses]);
 
   const handlePrevCycle = () => {
-    const prevAnchor = new Date(viewedCycle.start.getTime() - 86400000);
+    const prevAnchor = addDays(viewedCycle.start, -1);
     setViewedCycleAnchor(prevAnchor);
     setCalendarMonth(prevAnchor);
   };
   const handleNextCycle = () => {
-    const nextAnchor = new Date(viewedCycle.end.getTime() + 86400000);
+    const nextAnchor = addDays(viewedCycle.end, 1);
     setViewedCycleAnchor(nextAnchor);
     setCalendarMonth(nextAnchor);
   };
@@ -406,38 +630,11 @@ export default function App() {
     setViewedCycleAnchor(new Date());
     setCalendarMonth(new Date());
   };
-  const isViewingCurrentCycle = viewedCycle.start.getTime() === todayCycle.start.getTime();
+  const isViewingCurrentCycle = viewedStartStr === todayStartStr;
+  const isViewingFutureCycle = viewedStartStr > todayStartStr;
+  const daysLeft = isViewingCurrentCycle ? Math.max(1, daysBetween(toYYYYMMDD(new Date()), cycleStats.endStr) + 1) : 0;
 
-  if (!firebaseReady) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500 p-6 text-center">
-        <div>
-          <p className="font-bold text-gray-700 mb-1">Firebase isn't configured</p>
-          <p className="text-sm max-w-sm">Add your Firebase project's credentials as VITE_FIREBASE_* environment variables (see .env.example), then restart the dev server.</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (authLoading) {
-    return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Loading Ataraxia...</div>;
-  }
-
-  if (!user) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-center p-6 gap-4">
-        <Briefcase className="w-10 h-10 text-emerald-500" />
-        <div>
-          <h1 className="text-xl font-bold text-gray-800">Ataraxia</h1>
-          <p className="text-sm text-gray-500 mt-1 max-w-xs">You're signed out. Sign in with Google to see your synced budget.</p>
-        </div>
-        {authError && <p className="text-sm text-red-600">{authError}</p>}
-        <button onClick={handleGoogleSignIn} className="flex items-center gap-2 bg-white border border-gray-300 shadow-sm px-4 py-2 rounded-lg font-semibold text-gray-700 hover:bg-gray-50 transition-colors">
-          <GoogleGIcon className="w-5 h-5" /> Continue with Google
-        </button>
-      </div>
-    );
-  }
+  if (!user && app) return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Loading Ataraxia...</div>;
 
   return (
     <>
@@ -450,35 +647,22 @@ export default function App() {
             <h1 className="text-xl font-bold flex items-center gap-2">
               <Briefcase className="w-6 h-6 text-[var(--atx-accent)] transition-colors" /> Ataraxia
             </h1>
-
-            <div className="flex items-center gap-2 sm:gap-3">
-              <div className="hidden sm:flex items-center gap-3">
-                <div className="bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100 flex items-center gap-2">
-                  <CreditCard className="w-4 h-4 text-rose-500" />
-                  <span className="text-xs font-bold text-rose-700">Debt: {formatPHP(globalDebtTotal)}</span>
-                </div>
+            
+            <div className="hidden sm:flex items-center gap-3">
+              <div className="bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100 flex items-center gap-2">
+                <CreditCard className="w-4 h-4 text-rose-500" />
+                <span className="text-xs font-bold text-rose-700">Debt: {formatPHP(globalDebtTotal)}</span>
               </div>
+            </div>
 
-              <AuthControl user={user} onSignIn={handleGoogleSignIn} onSignOut={handleSignOut} />
-
-              <div className="flex space-x-1 sm:space-x-2">
-                <NavButton icon={CalendarIcon} label="Dashboard" active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} />
-                <NavButton icon={Target} label="Savings" active={activeTab === 'savings'} onClick={() => setActiveTab('savings')} />
-                <NavButton icon={PieChartIcon} label="Insights" active={activeTab === 'insights'} onClick={() => setActiveTab('insights')} />
-                <NavButton icon={Settings} label="Config" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
-              </div>
+            <div className="flex space-x-1 sm:space-x-2">
+              <NavButton icon={CalendarIcon} label="Dashboard" active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} />
+              <NavButton icon={Target} label="Savings" active={activeTab === 'savings'} onClick={() => setActiveTab('savings')} />
+              <NavButton icon={PieChartIcon} label="Insights" active={activeTab === 'insights'} onClick={() => setActiveTab('insights')} />
+              <NavButton icon={Settings} label="Config" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
             </div>
           </div>
         </header>
-
-        {authError && (
-          <div className="max-w-5xl mx-auto px-4 pt-3">
-            <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded-lg flex items-center justify-between gap-3">
-              <span>{authError}</span>
-              <button onClick={() => setAuthError(null)} className="text-red-400 hover:text-red-600 shrink-0"><X className="w-4 h-4"/></button>
-            </div>
-          </div>
-        )}
 
         <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
           {activeTab === 'calendar' && (
@@ -498,6 +682,9 @@ export default function App() {
                   <span className="text-sm font-bold text-gray-900 tracking-wide">
                     {viewedCycle.start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} — {viewedCycle.end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
                   </span>
+                  {isViewingFutureCycle && (
+                    <span className="text-[10px] uppercase font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full mt-1">Preview</span>
+                  )}
                   {!isViewingCurrentCycle && (
                     <button onClick={handleCurrentCycle} className="text-[10px] uppercase font-bold text-[var(--atx-accent)] bg-[var(--atx-accent-light)] px-2 py-0.5 rounded-full mt-1 flex items-center gap-1 hover:brightness-95">
                       <History className="w-3 h-3" /> Back to Current
@@ -509,12 +696,12 @@ export default function App() {
                 </button>
               </div>
 
-              <StatsHeader stats={cycleStats} isCurrent={isViewingCurrentCycle} />
+              <StatsHeader stats={cycleStats} isCurrent={isViewingCurrentCycle} missedIncome={missedIncome} daysLeft={daysLeft} />
               
               <MergedCalendarView 
                 calendarMonth={calendarMonth} setCalendarMonth={setCalendarMonth}
-                settings={settings} expenses={expenses} fixedExpenses={fixedExpenses} 
-                incomes={incomes} incomeRules={incomeRules} exceptions={exceptions}
+                schedule={schedule} expenses={expenses} fixedExpenses={fixedExpenses} 
+                incomes={incomes} incomeRules={incomeRules}
                 viewedStart={cycleStats.startStr} viewedEnd={cycleStats.endStr}
                 todayStart={toYYYYMMDD(todayCycle.start)} todayEnd={toYYYYMMDD(todayCycle.end)}
                 openDayModal={(d) => { setSelectedDateStr(d); setIsModalOpen(true); }}
@@ -528,17 +715,19 @@ export default function App() {
             <SavingsDebtView 
               user={user} db={db} appId={appId}
               savingsGoals={savingsGoals} debts={debts} expenses={expenses}
+              cycles={cycles} cutoffs={settings.cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth}
             />
           )}
           
           {activeTab === 'insights' && (
-            <InsightsView expenses={expenses} incomes={incomes} stats={cycleStats} />
+            <InsightsView cycles={cycles} viewedStartStr={viewedStartStr} cyclesPerMonth={cyclesPerMonth} />
           )}
           
           {activeTab === 'settings' && (
             <SettingsView 
               settings={settings} user={user} db={db} appId={appId} 
               fixedExpenses={fixedExpenses} incomeRules={incomeRules} 
+              expenses={expenses} incomes={incomes}
             />
           )}
         </main>
@@ -548,7 +737,7 @@ export default function App() {
           dateStr={selectedDateStr}
           expenses={expenses} fixedExpenses={fixedExpenses}
           incomes={incomes} incomeRules={incomeRules}
-          exceptions={exceptions} settings={settings}
+          exceptions={exceptions} schedule={schedule}
           savingsGoals={savingsGoals} debts={debts}
           user={user} db={db} appId={appId} 
         />
@@ -566,85 +755,96 @@ function NavButton({ icon: Icon, label, active, onClick }: NavButtonProps) {
   );
 }
 
-function GoogleGIcon({ className = "w-4 h-4" }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 48 48" className={className} aria-hidden="true">
-      <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"/>
-      <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z"/>
-      <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z"/>
-      <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z"/>
-    </svg>
-  );
-}
+function StatsHeader({ stats, isCurrent, missedIncome, daysLeft }: StatsHeaderProps) {
+  const { carryIn, expectedIncome, cycleReceivedIncome, totalExpenses, availableReality, healthState, healthPercent, isProjection, projectionDepth } = stats;
+  const showWarning = (healthState === 'caution' || healthState === 'danger') && (isCurrent || isProjection);
+  const pctLeft = expectedIncome > 0 ? Math.max(0, healthPercent) : null;
+  const perDay = isCurrent && daysLeft > 0 ? Math.max(0, availableReality) / daysLeft : null;
 
-function AuthControl({ user, onSignIn, onSignOut }: { user: User | null; onSignIn: () => void; onSignOut: () => void; }) {
-  if (!user || user.isAnonymous) {
-    return (
-      <button onClick={onSignIn} className="flex items-center gap-2 text-sm font-semibold text-gray-600 hover:bg-gray-100 border border-gray-200 px-2.5 sm:px-3 py-1.5 rounded-lg transition-colors">
-        <GoogleGIcon className="w-4 h-4" />
-        <span className="hidden sm:inline">Sign in with Google</span>
-      </button>
-    );
-  }
+  const availableSub = [
+    pctLeft !== null ? `${pctLeft.toFixed(0)}% of cycle earnings` : null,
+    perDay !== null ? `≈ ${formatPHP(perDay)}/day for ${plural(daysLeft, 'day', 'days')}` : null
+  ].filter(Boolean).join(' · ');
 
-  return (
-    <div className="flex items-center gap-1.5">
-      {user.photoURL ? (
-        <img src={user.photoURL} alt={user.displayName || 'Account'} referrerPolicy="no-referrer" className="w-7 h-7 rounded-full border border-gray-200" />
-      ) : (
-        <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center text-xs font-bold text-gray-600">
-          {(user.displayName || user.email || '?').charAt(0).toUpperCase()}
-        </div>
-      )}
-      <span className="hidden md:inline text-sm font-semibold text-gray-700 max-w-[120px] truncate">{user.displayName || user.email}</span>
-      <button onClick={onSignOut} title="Sign out" className="text-gray-400 hover:text-red-500 p-1.5 rounded-lg hover:bg-gray-100 transition-colors">
-        <LogOut className="w-4 h-4" />
-      </button>
-    </div>
-  );
-}
-
-function StatsHeader({ stats, isCurrent }: StatsHeaderProps) {
-  const { expectedIncome, cycleReceivedIncome, totalExpenses, availableReality, healthState } = stats;
+  const warningTitle = isProjection
+    ? (healthState === 'danger' ? 'Projected Shortfall' : 'Projected: Tight Budget')
+    : (healthState === 'danger' ? 'Danger Zone: Budget Low' : 'Caution: Budget Getting Low');
+  const warningMessage = availableReality < 0
+    ? `${isProjection ? 'You would be' : 'You are'} ${formatPHP(Math.abs(availableReality))} over budget for this cycle.`
+    : `Only ${formatPHP(availableReality)}${pctLeft !== null ? ` (${pctLeft.toFixed(0)}% of this cycle's earnings)` : ''} ${isProjection ? 'would be left' : 'is left'}.`;
 
   return (
     <div className="space-y-4">
-      {(healthState === 'caution' || healthState === 'danger') && isCurrent && (
-        <div className={`p-3 rounded-lg flex items-start gap-3 border shadow-sm ${healthState === 'danger' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
-          <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+      {isProjection && (
+        <div className="p-3 rounded-lg flex items-start gap-3 border shadow-sm bg-blue-50 border-blue-200 text-blue-800">
+          <Info className="w-5 h-5 shrink-0 mt-0.5" />
           <div>
-            <h4 className="font-bold text-sm">{healthState === 'danger' ? 'Danger Zone: Budget Low' : 'Caution: Monitoring Spending'}</h4>
-            <p className="text-xs mt-0.5">Your actual available budget (received minus spent) is running low relative to expectations.</p>
+            <h4 className="font-bold text-sm">Preview of an upcoming cycle</h4>
+            <p className="text-xs mt-0.5">
+              {projectionDepth === 1
+                ? `Starts with ${formatPHP(carryIn)} carried over from your current Available balance, which is what you'd have if you spend nothing more than what's already scheduled. Income you haven't received yet this cycle isn't counted.`
+                : `Starts with ${formatPHP(carryIn)} projected from the cycle before it, assuming all expected income arrives and you spend nothing beyond what's scheduled.`}
+            </p>
           </div>
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-        <StatCard title="Expected Income" value={expectedIncome} icon={<Wallet className="w-4 h-4 text-gray-400"/>} className="border-l-4 border-l-gray-300" />
+      {showWarning && (
+        <div className={`p-3 rounded-lg flex items-start gap-3 border shadow-sm ${healthState === 'danger' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+          <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+          <div>
+            <h4 className="font-bold text-sm">{warningTitle}</h4>
+            <p className="text-xs mt-0.5">{warningMessage}</p>
+            <p className="text-[11px] mt-1 opacity-80">Caution starts below {CAUTION_PERCENT}% of the cycle's earnings, danger below {DANGER_PERCENT}%.</p>
+          </div>
+        </div>
+      )}
+
+      {missedIncome > 0 && (isCurrent || isProjection) && (
+        <div className="p-3 rounded-lg flex items-start gap-3 border bg-gray-50 border-gray-200 text-gray-700">
+          <Info className="w-4 h-4 shrink-0 mt-0.5 text-gray-400" />
+          <p className="text-xs">
+            {formatPHP(missedIncome)} of expected income from past cycles was never marked as received, so it isn't part of your carried-over balance. Open those days on the calendar and tap Receive to include it.
+          </p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 sm:gap-4">
+        <StatCard title="Carried Over" value={carryIn} icon={<Layers className="w-4 h-4 text-gray-400"/>} className="border-l-4 border-l-blue-400" sub={isProjection ? 'Projected from before' : 'From previous cycle'} signed />
+        <StatCard title="Expected Income" value={expectedIncome} icon={<Wallet className="w-4 h-4 text-gray-400"/>} className="border-l-4 border-l-gray-300" sub="This cycle only" />
         <StatCard title="Received Income" value={cycleReceivedIncome} icon={<ArrowDownToLine className="w-4 h-4 text-[var(--status-safe)]"/>} className="border-l-4 border-l-[var(--status-safe)]" />
-        <StatCard title="Total Spent" value={totalExpenses} icon={<ArrowUpFromLine className="w-4 h-4 text-[var(--status-danger)]"/>} className="border-l-4 border-l-[var(--status-danger)]" />
-        <StatCard title="Available (Reality)" value={availableReality} icon={<CheckCircle2 className="w-4 h-4 text-[var(--atx-accent)]"/>} className="border-l-4 border-l-[var(--atx-accent)] md:col-span-1 col-span-2" highlight />
+        <StatCard title="Total Spent" value={totalExpenses} icon={<ArrowUpFromLine className="w-4 h-4 text-[var(--status-danger)]"/>} className="border-l-4 border-l-[var(--status-danger)]" sub="Logged + scheduled" />
+        <StatCard title={isProjection ? 'Projected Available' : 'Available (Reality)'} value={availableReality} icon={<CheckCircle2 className="w-4 h-4 text-[var(--atx-accent)]"/>} className="border-l-4 border-l-[var(--atx-accent)] md:col-span-1 col-span-2" highlight sub={availableSub || undefined} />
       </div>
+      <p className="text-[11px] text-gray-400 px-1">
+        {isProjection ? 'Projected Available = Carried Over + Expected Income − Total Spent' : 'Available = Carried Over + Received Income − Total Spent'}
+      </p>
     </div>
   );
 }
 
-function StatCard({ title, value, icon, className = "", highlight = false }: StatCardProps) {
+function StatCard({ title, value, icon, className = "", highlight = false, sub, signed = false }: StatCardProps) {
+  const valueColor = highlight
+    ? (value < 0 ? 'text-[var(--status-danger)]' : 'text-[var(--atx-accent)]')
+    : (signed && value < 0 ? 'text-[var(--status-danger)]' : 'text-gray-800');
   return (
     <div className={`atx-card p-4 rounded-xl shadow-sm flex flex-col justify-between h-full ${className}`}>
       <div className="flex justify-between items-center mb-2">
         <p className="text-xs text-[var(--atx-text-muted)] font-medium uppercase tracking-wide">{title}</p>
         {icon}
       </div>
-      <p className={`text-xl sm:text-2xl font-bold truncate ${highlight ? (value < 0 ? 'text-[var(--status-danger)]' : 'text-[var(--atx-accent)]') : 'text-gray-800'}`}>
-        {formatPHP(value)}
-      </p>
+      <div>
+        <p className={`text-xl sm:text-2xl font-bold truncate ${valueColor}`}>
+          {formatPHP(value)}
+        </p>
+        {sub && <p className="text-[10px] text-gray-400 mt-1 leading-snug">{sub}</p>}
+      </div>
     </div>
   );
 }
 
 function MergedCalendarView({ 
-  calendarMonth, setCalendarMonth, settings, expenses, fixedExpenses, incomes, incomeRules, exceptions,
+  calendarMonth, setCalendarMonth, schedule, expenses, fixedExpenses, incomes, incomeRules,
   viewedStart, viewedEnd, todayStart, todayEnd, openDayModal, showIncome, setShowIncome, showExpenses, setShowExpenses
 }: MergedCalendarViewProps) {
   const year = calendarMonth.getFullYear();
@@ -696,32 +896,12 @@ function MergedCalendarView({
 
           const dateStr = toYYYYMMDD(dateObj);
           const dayOfMonth = dateObj.getDate();
-          const baseWorkDay = getBaseWorkDay(dateStr, dateObj, settings);
-          const isDayAbsent = isAbsent(dateStr, exceptions);
-          const isActualWorkDay = baseWorkDay && !isDayAbsent;
-          
-          let expTotal = 0;
-          let incTotal = 0;
-          
-          // Accumulate Expenses
-          if (showExpenses) {
-            fixedExpenses.forEach(item => {
-              if (exceptions.some(ex => ex.date === dateStr && ex.targetId === item.id && ex.type === 'expense_skip')) return;
-              if (item.workingDaysOnly && !isActualWorkDay) return;
-              if (item.frequency === 'daily' || (item.frequency === 'monthly' && Number(item.date) === dayOfMonth)) expTotal += Number(item.amount);
-            });
-            expenses.filter(e => e.date === dateStr).forEach(e => expTotal += Number(e.amount));
-          }
+          const baseWorkDay = getBaseWorkDay(dateStr, dateObj, schedule.settings);
+          const isDayAbsent = schedule.absences.has(dateStr);
 
-          // Accumulate Income
-          if (showIncome) {
-            incomeRules.forEach(item => {
-              if (exceptions.some(ex => ex.date === dateStr && ex.targetId === item.id && ex.type === 'income_skip')) return;
-              if (item.workingDaysOnly && !isActualWorkDay) return;
-              if (item.frequency === 'daily' || (item.frequency === 'monthly' && Number(item.date) === dayOfMonth)) incTotal += Number(item.amount);
-            });
-            incomes.filter(i => i.date === dateStr).forEach(i => incTotal += Number(i.amount));
-          }
+          const flows = getDayFlows(schedule, fixedExpenses, incomeRules, expenses, incomes, dateStr, dateObj);
+          const expTotal = showExpenses ? flows.scheduledExpense + flows.loggedExpense : 0;
+          const incTotal = showIncome ? flows.scheduledIncome + flows.loggedIncome : 0;
 
           const isViewedCycle = dateStr >= viewedStart && dateStr <= viewedEnd;
           const isTodayCycle = dateStr >= todayStart && dateStr <= todayEnd;
@@ -756,12 +936,12 @@ function MergedCalendarView({
 
               <div className="flex-1 mt-auto z-10 flex flex-col justify-end gap-1 overflow-y-auto hidden-scrollbar">
                 {showIncome && incTotal > 0 && (
-                  <div className={`text-[10px] sm:text-xs font-bold rounded px-1 py-0.5 text-center truncate ${isFuture && !incomes.some(i=>i.date===dateStr && i.isReceived) ? 'bg-emerald-50 text-emerald-500 border border-emerald-200 border-dashed' : 'bg-emerald-100 text-emerald-700'}`}>
+                  <div className={`text-[10px] sm:text-xs font-bold rounded px-1 py-0.5 text-center truncate ${flows.pendingIncome > 0 ? 'bg-emerald-50 text-emerald-500 border border-emerald-200 border-dashed' : 'bg-emerald-100 text-emerald-700'}`}>
                     +{formatPHP(incTotal)}
                   </div>
                 )}
                 {showExpenses && expTotal > 0 && (
-                  <div className={`text-[10px] sm:text-xs font-bold rounded px-1 py-0.5 text-center truncate ${isFuture && !expenses.some(e=>e.date===dateStr) ? 'bg-rose-50 text-rose-400 border border-rose-200 border-dashed' : 'bg-rose-100 text-rose-700'}`}>
+                  <div className={`text-[10px] sm:text-xs font-bold rounded px-1 py-0.5 text-center truncate ${isFuture && !flows.hasLoggedExpense ? 'bg-rose-50 text-rose-400 border border-rose-200 border-dashed' : 'bg-rose-100 text-rose-700'}`}>
                     -{formatPHP(expTotal)}
                   </div>
                 )}
@@ -775,7 +955,9 @@ function MergedCalendarView({
   );
 }
 
-function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: SavingsDebtViewProps) {
+
+function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycles, cutoffs, todayStartStr, cyclesPerMonth }: SavingsDebtViewProps) {
+  const [subTab, setSubTab] = useState<'overview' | 'split'>('overview');
   const [goalName, setGoalName] = useState('');
   const [goalTarget, setGoalTarget] = useState('');
   const [debtName, setDebtName] = useState('');
@@ -801,7 +983,7 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: Sav
   };
 
   // Compute progress/balances based on linked expenses
-  const goalsWithProgress = savingsGoals.map(g => {
+  const goalsWithProgress: GoalWithProgress[] = savingsGoals.map(g => {
     const saved = expenses.filter(e => e.linkedType === 'goal' && e.linkedTo === g.id).reduce((s, e) => s + Number(e.amount), 0);
     return { ...g, saved, pct: Math.min(100, (saved / (Number(g.targetAmount) || 1)) * 100) };
   });
@@ -813,6 +995,15 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: Sav
   });
 
   return (
+    <div className="space-y-6">
+      <div className="inline-flex bg-gray-100 p-1 rounded-lg">
+        <button onClick={() => setSubTab('overview')} className={`px-4 py-1.5 text-sm font-bold rounded-md transition-colors ${subTab === 'overview' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Goals & Debts</button>
+        <button onClick={() => setSubTab('split')} className={`px-4 py-1.5 text-sm font-bold rounded-md transition-colors ${subTab === 'split' ? 'bg-white shadow-sm text-emerald-700' : 'text-gray-500'}`}>Split Planner</button>
+      </div>
+
+      {subTab === 'split' ? (
+        <SplitPlanner goals={goalsWithProgress} cycles={cycles} cutoffs={cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth} />
+      ) : (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in slide-in-from-bottom-4 duration-300">
       {/* Goals Section */}
       <div className="atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400">
@@ -878,13 +1069,219 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses }: Sav
         </div>
       </div>
     </div>
+      )}
+    </div>
   );
 }
+
+function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }: SplitPlannerProps) {
+  const [source, setSource] = useState<string>('custom'); // a goal id, or 'custom'
+  const [customName, setCustomName] = useState('');
+  const [customAmount, setCustomAmount] = useState('');
+  const [unit, setUnit] = useState<'cycles' | 'months'>('cycles');
+  const [length, setLength] = useState('6');
+  const [startNext, setStartNext] = useState(false);
+
+  const goal = goals.find(g => g.id === source);
+  const remainingForGoal = goal ? Math.max(0, num(goal.targetAmount) - goal.saved) : 0;
+  const amount = goal ? remainingForGoal : Math.max(0, num(customAmount));
+  const itemName = goal ? goal.name : (customName.trim() || 'Your goal');
+
+  const lengthNum = Math.min(120, Math.max(1, Math.floor(num(length)) || 1));
+  const totalCycles = Math.min(120, unit === 'cycles' ? lengthNum : lengthNum * cyclesPerMonth);
+  const totalMonths = totalCycles / cyclesPerMonth;
+
+  const perCycle = amount / totalCycles;
+  const perMonth = perCycle * cyclesPerMonth;
+
+  // Split in whole centavos so the schedule always adds up exactly to the target.
+  const schedule = useMemo(() => {
+    const first = getActivePeriod(parseYMD(todayStartStr), cutoffs);
+    let anchor = startNext ? addDays(first.end, 1) : first.start;
+    const cents = Math.round(amount * 100);
+    const base = Math.floor(cents / totalCycles);
+    const extra = cents - base * totalCycles;
+    const rows: { n: number; start: string; end: string; amount: number; cumulative: number; remaining: number }[] = [];
+    let running = 0;
+    for (let i = 0; i < totalCycles; i++) {
+      const p = getActivePeriod(anchor, cutoffs);
+      const portion = (base + (i < extra ? 1 : 0)) / 100;
+      running = round2(running + portion);
+      rows.push({ n: i + 1, start: toYYYYMMDD(p.start), end: toYYYYMMDD(p.end), amount: portion, cumulative: running, remaining: round2(Math.max(0, amount - running)) });
+      anchor = addDays(p.end, 1);
+    }
+    return rows;
+  }, [amount, totalCycles, startNext, todayStartStr, cutoffs]);
+
+  // What you typically have left over per finished cycle (income actually received minus spending, ignoring goal contributions).
+  const avgSurplus = useMemo(() => {
+    const finished = cycles.filter(c => !c.isCurrent && !c.isFuture && c.entries.length > 0).slice(-6);
+    if (finished.length === 0) return null;
+    const total = finished.reduce((sum, c) => {
+      const spentExcludingGoals = c.entries.filter(e => e.kind === 'expense' && e.linkedType !== 'goal').reduce((s, e) => s + e.amount, 0);
+      return sum + (c.receivedIncome - spentExcludingGoals);
+    }, 0);
+    return total / finished.length;
+  }, [cycles]);
+
+  const optionCycles = [2, 4, 6, 12, 24];
+
+  let verdict: { tone: 'good' | 'warn' | 'bad' | 'info'; text: string } | null = null;
+  if (amount > 0) {
+    if (avgSurplus === null) {
+      verdict = { tone: 'info', text: 'Once you have a few finished cycles, this will compare the plan with what you usually have left over.' };
+    } else if (avgSurplus <= 0) {
+      verdict = { tone: 'bad', text: `Your recent cycles ended with no money left over on average, so this plan would need spending cuts or more income.` };
+    } else {
+      const share = (perCycle / avgSurplus) * 100;
+      const needed = Math.ceil(amount / avgSurplus);
+      if (share <= 70) verdict = { tone: 'good', text: `That's ${share.toFixed(0)}% of the ${formatPHP(avgSurplus)} you usually have left per cycle. Comfortable.` };
+      else if (share <= 100) verdict = { tone: 'warn', text: `That's ${share.toFixed(0)}% of the ${formatPHP(avgSurplus)} you usually have left per cycle. Doable, but tight.` };
+      else verdict = { tone: 'bad', text: `That's more than the ${formatPHP(avgSurplus)} you usually have left per cycle. At your usual pace it would take about ${needed} ${needed === 1 ? 'cycle' : 'cycles'} / ${formatMonths(needed / cyclesPerMonth)}.` };
+    }
+  }
+  const verdictClass = verdict === null ? '' : verdict.tone === 'good' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : verdict.tone === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800' : verdict.tone === 'bad' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-gray-50 border-gray-200 text-gray-600';
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 animate-in slide-in-from-bottom-4 duration-300">
+      <div className="lg:col-span-2 atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400 space-y-5 self-start">
+        <div>
+          <h2 className="text-lg font-bold text-emerald-800 flex items-center gap-2"><Target className="w-5 h-5"/> Split a Cost</h2>
+          <p className="text-xs text-gray-500 mt-1">Spread what you want to buy across your pay cycles to see what to set aside each time.</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-bold text-gray-600 mb-1">What are you saving for?</label>
+          <select value={source} onChange={e => setSource(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm bg-white outline-none">
+            <option value="custom">Something new (enter an amount)</option>
+            {goals.length > 0 && <optgroup label="Your savings goals">{goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</optgroup>}
+          </select>
+        </div>
+
+        {goal ? (
+          <div className="bg-emerald-50 border border-emerald-100 rounded-lg p-3 text-xs space-y-1">
+            <div className="flex justify-between"><span className="text-gray-500">Target</span><span className="font-bold">{formatPHP(goal.targetAmount)}</span></div>
+            <div className="flex justify-between"><span className="text-gray-500">Already saved</span><span className="font-bold text-emerald-700">{formatPHP(goal.saved)}</span></div>
+            <div className="flex justify-between border-t border-emerald-100 pt-1"><span className="text-gray-600 font-semibold">Left to split</span><span className="font-bold">{formatPHP(remainingForGoal)}</span></div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-5 gap-2">
+            <input type="text" placeholder="Name (optional)" value={customName} onChange={e => setCustomName(e.target.value)} className="col-span-3 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+            <input type="number" placeholder="Cost ₱" min="0" step="0.01" value={customAmount} onChange={e => setCustomAmount(e.target.value)} className="col-span-2 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+          </div>
+        )}
+
+        <div>
+          <label className="block text-xs font-bold text-gray-600 mb-1">Split it over</label>
+          <div className="flex gap-2">
+            <input type="number" min="1" max="120" value={length} onChange={e => setLength(e.target.value)} className="w-24 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+            <div className="flex bg-gray-100 p-1 rounded-lg flex-1">
+              <button onClick={() => setUnit('cycles')} className={`flex-1 px-3 py-1 text-xs font-bold rounded-md transition-colors ${unit === 'cycles' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Cycles</button>
+              <button onClick={() => setUnit('months')} className={`flex-1 px-3 py-1 text-xs font-bold rounded-md transition-colors ${unit === 'months' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Months</button>
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-1">{plural(cyclesPerMonth, 'cycle', 'cycles')} per month with your current cut-off dates.</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-bold text-gray-600 mb-1">Start saving</label>
+          <div className="flex bg-gray-100 p-1 rounded-lg">
+            <button onClick={() => setStartNext(false)} className={`flex-1 px-3 py-1 text-xs font-bold rounded-md transition-colors ${!startNext ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>This cycle</button>
+            <button onClick={() => setStartNext(true)} className={`flex-1 px-3 py-1 text-xs font-bold rounded-md transition-colors ${startNext ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Next cycle</button>
+          </div>
+        </div>
+
+        <div>
+          <p className="text-xs font-bold text-gray-600 mb-2">Compare options</p>
+          <div className="grid grid-cols-5 gap-1.5">
+            {optionCycles.map(n => (
+              <button key={n} disabled={amount <= 0} onClick={() => { setUnit('cycles'); setLength(String(n)); }}
+                className={`rounded-lg border p-1.5 text-center transition-colors ${totalCycles === n ? 'border-emerald-400 bg-emerald-50' : 'border-gray-200 bg-white hover:bg-gray-50'} disabled:opacity-40`}>
+                <span className="block text-[11px] font-bold text-gray-800">{n}/{formatMonths(n / cyclesPerMonth).replace(' months', 'mo').replace(' month', 'mo')}</span>
+                <span className="block text-[10px] text-gray-500 truncate">{amount > 0 ? compactPHP(amount / n) : '—'}</span>
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-gray-400 mt-1">Cycles / months, with the amount to set aside each cycle.</p>
+        </div>
+      </div>
+
+      <div className="lg:col-span-3 space-y-6">
+        {amount <= 0 ? (
+          <div className="atx-card p-10 rounded-xl shadow-sm text-center text-gray-400">
+            <Target className="w-10 h-10 mx-auto mb-2 opacity-20" />
+            <p className="text-sm italic">{goal ? `${goal.name} is already fully funded.` : 'Enter a cost to see how it splits across your cycles.'}</p>
+          </div>
+        ) : (
+          <>
+            <div className="atx-card p-6 rounded-xl shadow-sm">
+              <p className="text-xs text-gray-500">{itemName} · {formatPHP(amount)}</p>
+              <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-2">
+                <div>
+                  <p className="text-3xl font-bold text-emerald-700">{formatPHP(perCycle)}</p>
+                  <p className="text-xs text-gray-500">per cycle</p>
+                </div>
+                <div>
+                  <p className="text-xl font-bold text-gray-800">{formatPHP(perMonth)}</p>
+                  <p className="text-xs text-gray-500">per month</p>
+                </div>
+                <div className="ml-auto text-right">
+                  <p className="text-xl font-bold text-gray-800">{totalCycles} {totalCycles === 1 ? 'cycle' : 'cycles'} / {formatMonths(totalMonths)}</p>
+                  <p className="text-xs text-gray-500">done by {schedule.length > 0 ? longDate(schedule[schedule.length - 1].end) : '—'}</p>
+                </div>
+              </div>
+              {verdict && (
+                <div className={`mt-4 p-3 rounded-lg border text-xs flex items-start gap-2 ${verdictClass}`}>
+                  <Lightbulb className="w-4 h-4 shrink-0 mt-0.5" />
+                  <p>{verdict.text}</p>
+                </div>
+              )}
+            </div>
+
+            <div className="atx-card rounded-xl shadow-sm overflow-hidden">
+              <div className="px-5 py-3 border-b border-[var(--atx-border)] bg-gray-50">
+                <h3 className="font-bold text-gray-800 text-sm">Saving schedule</h3>
+              </div>
+              <div className="max-h-96 overflow-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-white sticky top-0 text-[11px] text-gray-400">
+                    <tr>
+                      <th className="text-left font-semibold px-5 py-2">Cycle</th>
+                      <th className="text-left font-semibold px-2 py-2">Dates</th>
+                      <th className="text-right font-semibold px-2 py-2">Set aside</th>
+                      <th className="text-right font-semibold px-2 py-2">Total saved</th>
+                      <th className="text-right font-semibold px-5 py-2">Still to go</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {schedule.map(r => (
+                      <tr key={r.n} className="border-t border-gray-100">
+                        <td className="px-5 py-2 font-semibold text-gray-700">{r.n}/{totalCycles}</td>
+                        <td className="px-2 py-2 text-gray-500 whitespace-nowrap">{shortDate(r.start)} – {shortDate(r.end)}</td>
+                        <td className="px-2 py-2 text-right font-bold text-emerald-700">{formatPHP(r.amount)}</td>
+                        <td className="px-2 py-2 text-right text-gray-700">{formatPHP(r.cumulative)}</td>
+                        <td className="px-5 py-2 text-right text-gray-500">{formatPHP(r.remaining)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <p className="text-[11px] text-gray-400 px-1">
+              To track progress, log each contribution as an expense linked to the goal on the calendar. The goal's saved amount updates automatically.
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 // Reusing logic from the updated constraints, merging expense and income inputs into one modal interface
 
 function DayDetailsModal({ 
-  isOpen, onClose, dateStr, expenses, fixedExpenses, incomes, incomeRules, exceptions, settings,
+  isOpen, onClose, dateStr, expenses, fixedExpenses, incomes, incomeRules, exceptions, schedule,
   savingsGoals, debts, user, db, appId 
 }: DayDetailsModalProps) {
   const [subTab, setSubTab] = useState<'expense' | 'income'>('expense'); // 'expense' or 'income'
@@ -895,16 +1292,16 @@ function DayDetailsModal({
   
   const [confirmData, setConfirmData] = useState<ConfirmData | null>(null); 
 
-  useEffect(() => { if (isOpen) { setSubTab('expense'); setAmount(''); setDescName(''); setCategory(''); setLinkedTo(''); } }, [isOpen]);
+  useEffect(() => { if (isOpen) { setSubTab('expense'); setAmount(''); setDescName(''); setLinkedTo(''); } }, [isOpen]);
 
   if (!isOpen || !dateStr) return null;
 
-  const dateObj = new Date(dateStr);
-  const baseWorkDay = getBaseWorkDay(dateStr, dateObj, settings);
-  const isDayAbsent = isAbsent(dateStr, exceptions);
+  const dateObj = parseYMD(dateStr);
+  const baseWorkDay = getBaseWorkDay(dateStr, dateObj, schedule.settings);
+  const isDayAbsent = schedule.absences.has(dateStr);
 
-  const dailyFixedExp = fixedExpenses.filter(exp => (exp.frequency === 'daily' || (exp.frequency === 'monthly' && Number(exp.date) === dateObj.getDate())));
-  const dailyFixedInc = incomeRules.filter(inc => (inc.frequency === 'daily' || (inc.frequency === 'monthly' && Number(inc.date) === dateObj.getDate())));
+  const dailyFixedExp = fixedExpenses.filter(exp => ruleScheduledOn(schedule, exp, dateStr, dateObj));
+  const dailyFixedInc = incomeRules.filter(inc => ruleScheduledOn(schedule, inc, dateStr, dateObj));
   const customExp = expenses.filter(e => e.date === dateStr);
   const customInc = incomes.filter(i => i.date === dateStr);
 
@@ -915,9 +1312,10 @@ function DayDetailsModal({
     let linkedType: LinkedType = null;
     let finalLinkedTo: string | null = null;
     if (subTab === 'expense' && linkedTo) {
-      const [type, id] = linkedTo.split('_');
+      const sep = linkedTo.indexOf('_');
+      const type = linkedTo.slice(0, sep);
       linkedType = type === 'goal' || type === 'debt' ? type : null;
-      finalLinkedTo = id;
+      finalLinkedTo = linkedTo.slice(sep + 1);
     }
 
     try {
@@ -956,15 +1354,20 @@ function DayDetailsModal({
           );
         }
       } else if (confirmData.action === 'markReceived') {
-        await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'incomes'), {
-          date: dateStr,
-          amount: confirmData.data.amount,
-          name: confirmData.data.name,
-          category: confirmData.data.category,
-          ruleId: confirmData.data.id,
-          isReceived: true,
-          createdAt: new Date().toISOString(),
-        });
+        const rule = confirmData.data;
+        // Guard against a double tap creating a second "received" record (which would double the income).
+        const alreadyReceived = incomes.some(i => i.ruleId === rule.id && i.date === dateStr && i.isReceived !== false);
+        if (!alreadyReceived) {
+          await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'incomes'), {
+            date: dateStr,
+            amount: rule.amount,
+            name: rule.name,
+            category: rule.category,
+            ruleId: rule.id,
+            isReceived: true,
+            createdAt: new Date().toISOString(),
+          });
+        }
       }
       setConfirmData(null);
     } catch (err) { console.error(err); }
@@ -1026,7 +1429,7 @@ function DayDetailsModal({
                 dailyFixedExp.length === 0 ? <p className="text-xs text-gray-500 italic px-2">None today.</p> : (
                   <div className="space-y-2">
                     {dailyFixedExp.map(exp => {
-                      const inactive = exceptions.some(ex => ex.date === dateStr && ex.targetId === exp.id && ex.type === 'expense_skip') || (exp.workingDaysOnly && (!baseWorkDay || isDayAbsent));
+                      const inactive = !ruleLiveOn(schedule, exp, dateStr, dateObj, 'expense_skip');
                       return (
                         <div key={exp.id} className={`flex justify-between items-center p-3 rounded-lg border text-sm transition-all ${inactive ? 'bg-gray-100 border-gray-200 opacity-60' : 'bg-white border-gray-200 shadow-sm'}`}>
                           <span className={`font-semibold ${inactive ? 'line-through text-gray-500' : 'text-gray-800'}`}>{exp.name}</span>
@@ -1043,7 +1446,7 @@ function DayDetailsModal({
                 dailyFixedInc.length === 0 ? <p className="text-xs text-gray-500 italic px-2">None today.</p> : (
                   <div className="space-y-2">
                     {dailyFixedInc.map(inc => {
-                      const inactive = exceptions.some(ex => ex.date === dateStr && ex.targetId === inc.id && ex.type === 'income_skip') || (inc.workingDaysOnly && (!baseWorkDay || isDayAbsent));
+                      const inactive = !ruleLiveOn(schedule, inc, dateStr, dateObj, 'income_skip');
                       const received = customInc.some(ci => ci.ruleId === inc.id && ci.isReceived);
                       return (
                         <div key={inc.id} className={`flex justify-between items-center p-3 rounded-lg border text-sm transition-all ${inactive ? 'bg-gray-100 border-gray-200 opacity-60' : received ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-gray-200 shadow-sm'}`}>
@@ -1142,82 +1545,473 @@ function ConfirmModal({ isOpen, title, message, onConfirm, onCancel, confirmText
   );
 }
 
-function InsightsView({ expenses, incomes, stats }: InsightsViewProps) {
-  const [metricType, setMetricType] = useState('expense'); 
-  
-  const chartData = useMemo(() => {
-    const dataMap: Record<string, number> = {};
-    const categories = metricType === 'expense' ? DEFAULT_EXPENSE_CATEGORIES : DEFAULT_INCOME_CATEGORIES;
-    const sourceData = metricType === 'expense' ? expenses : incomes;
-    categories.forEach(c => dataMap[c] = 0);
-    
-    sourceData.forEach(item => {
-      if (item.date >= stats.startStr && item.date <= stats.endStr) {
-        dataMap[item.category || 'Other'] = (dataMap[item.category || 'Other'] || 0) + Number(item.amount);
-      }
-    });
+const RANGE_MONTHS: Record<'1m' | '3m' | '6m' | '1y', number> = { '1m': 1, '3m': 3, '6m': 6, '1y': 12 };
+const RANGE_NOUN: Record<InsightRange, string> = { cycle: 'cycle', '1m': 'month', '3m': '3 months', '6m': '6 months', '1y': '12 months', all: 'period' };
+const sumOf = (list: number[]) => list.reduce((a, b) => a + b, 0);
 
-    return Object.keys(dataMap).map(key => ({ name: key, value: dataMap[key] })).filter(i => i.value > 0).sort((a, b) => b.value - a.value);
-  }, [expenses, incomes, stats, metricType]);
+const groupByCategory = (list: LedgerEntry[]): NamedAmount[] => {
+  const totals = new Map<string, number>();
+  list.forEach(e => totals.set(e.category, (totals.get(e.category) ?? 0) + e.amount));
+  return Array.from(totals, ([name, value]) => ({ name, value: round2(value) }))
+    .filter(item => item.value > 0)
+    .sort((a, b) => b.value - a.value);
+};
 
-  const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#64748b'];
+const buildReport = (cycles: CycleRow[], range: InsightRange, viewedStartStr: string, cyclesPerMonth: number, todayStr: string): ReportData | null => {
+  if (cycles.length === 0) return null;
 
-  const handleExport = () => {
-    const csvRows = ["Type,Date,Description,Category,Amount"];
-    expenses.forEach(e => csvRows.push(`Expense,${e.date},"${e.description}",${e.category || 'Other'},${e.amount}`));
-    incomes.forEach(i => csvRows.push(`Income,${i.date},"${i.name}",${i.category || 'Other'},${i.amount}`));
-    const link = document.createElement("a");
-    link.href = encodeURI("data:text/csv;charset=utf-8," + csvRows.join("\n"));
-    link.download = `Ataraxia_Export.csv`;
-    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+  const foundCurrent = cycles.findIndex(c => c.isCurrent);
+  const curIdx = foundCurrent >= 0 ? foundCurrent : cycles.length - 1;
+  const foundViewed = cycles.findIndex(c => c.startStr === viewedStartStr);
+  const viewedIdx = foundViewed >= 0 ? foundViewed : curIdx;
+  const firstActive = cycles.findIndex(c => c.entries.length > 0);
+
+  let startIdx = viewedIdx;
+  let endIdx = viewedIdx;
+  if (range !== 'cycle') {
+    endIdx = curIdx;
+    const span = range === 'all' ? curIdx + 1 : RANGE_MONTHS[range] * cyclesPerMonth;
+    startIdx = Math.max(0, curIdx - span + 1);
+    // Don't pad the report with empty cycles from before you started using the app.
+    if (firstActive >= 0) startIdx = Math.max(startIdx, Math.min(firstActive, curIdx));
+  }
+
+  const rows = cycles.slice(startIdx, endIdx + 1);
+  if (rows.length === 0) return null;
+  const len = rows.length;
+  const startStr = rows[0].startStr;
+  const endStr = rows[len - 1].endStr;
+  const includesCurrent = rows.some(r => r.isCurrent);
+
+  const income = round2(sumOf(rows.map(r => r.receivedIncome)));
+  const pendingIncome = round2(sumOf(rows.map(r => r.pendingIncome)));
+  const spent = round2(sumOf(rows.map(r => r.totalExpenses)));
+  const scheduledSpent = round2(sumOf(rows.map(r => r.scheduledExpenses)));
+  const loggedSpent = round2(sumOf(rows.map(r => r.manualExpenses)));
+  const net = round2(income - spent);
+  const savingsRate = income > 0 ? (net / income) * 100 : null;
+
+  const entries = rows.flatMap(r => r.entries);
+  const expenseEntries = entries.filter(e => e.kind === 'expense');
+  const receivedIncomeEntries = entries.filter(e => e.kind === 'income' && e.received);
+
+  // "Per day" figures only look at days that have already happened.
+  const asOf = endStr < todayStr ? endStr : todayStr;
+  const days = asOf >= startStr ? daysBetween(startStr, asOf) + 1 : 0;
+  const spentToDate = sumOf(expenseEntries.filter(e => e.date <= asOf).map(e => e.amount));
+  const avgDaily = days > 0 ? spentToDate / days : 0;
+
+  const goalContrib = round2(sumOf(expenseEntries.filter(e => e.linkedType === 'goal').map(e => e.amount)));
+  const debtPaid = round2(sumOf(expenseEntries.filter(e => e.linkedType === 'debt').map(e => e.amount)));
+
+  const expenseCats = groupByCategory(expenseEntries);
+  const incomeCats = groupByCategory(receivedIncomeEntries);
+
+  const itemMap = new Map<string, TopItem>();
+  expenseEntries.forEach(e => {
+    const name = e.label.trim() || 'Untitled';
+    const key = name.toLowerCase();
+    const existing = itemMap.get(key);
+    if (existing) { existing.value += e.amount; existing.count += 1; }
+    else itemMap.set(key, { name, value: e.amount, count: 1 });
+  });
+  const topItems = Array.from(itemMap.values()).map(v => ({ ...v, value: round2(v.value) })).sort((a, b) => b.value - a.value).slice(0, 8);
+
+  const weekdayTotals = new Array<number>(7).fill(0);
+  const weekdayDays = new Array<number>(7).fill(0);
+  const loggedToDate = expenseEntries.filter(e => e.source === 'manual' && e.date <= asOf);
+  loggedToDate.forEach(e => { weekdayTotals[parseYMD(e.date).getDay()] += e.amount; });
+  for (let i = 0, d = parseYMD(startStr); i < days; i++, d = addDays(d, 1)) weekdayDays[d.getDay()] += 1;
+  const weekday: WeekdayStat[] = [1, 2, 3, 4, 5, 6, 0].map(id => ({
+    day: DAYS_OF_WEEK[id].short, total: round2(weekdayTotals[id]), avg: weekdayDays[id] > 0 ? round2(weekdayTotals[id] / weekdayDays[id]) : 0
+  }));
+
+  const series: CycleSeriesPoint[] = rows.map(r => ({
+    label: len > 12 ? `${shortDate(r.startStr)} '${r.startStr.slice(2, 4)}` : shortDate(r.startStr),
+    fullLabel: `${shortDate(r.startStr)} – ${shortDate(r.endStr)}`,
+    carryIn: r.carryIn, income: r.receivedIncome, spent: r.totalExpenses, scheduled: r.scheduledExpenses, logged: r.manualExpenses,
+    net: round2(r.receivedIncome - r.totalExpenses), balance: r.available,
+    status: r.isFuture ? 'Projected' : r.isCurrent ? 'In progress' : ''
+  }));
+
+  // Compare with the window of the same length right before this one.
+  let prev: ReportData['prev'] = null;
+  if (range !== 'all' && startIdx - len >= 0) {
+    const prevRows = cycles.slice(startIdx - len, startIdx);
+    const prevSpent = round2(sumOf(prevRows.map(r => r.totalExpenses)));
+    if (prevSpent > 0) prev = { income: round2(sumOf(prevRows.map(r => r.receivedIncome))), spent: prevSpent };
+  }
+
+  const lastRow = rows[len - 1];
+  const closingBalance = lastRow.available;
+  const balanceLabel = lastRow.isCurrent ? 'Available now' : lastRow.isFuture ? 'Projected balance' : 'Balance at end';
+
+  // ---- Written insights ----
+  const insights: ReportInsight[] = [];
+  const completed = rows.filter(r => !r.isCurrent && !r.isFuture);
+
+  if (income > 0) {
+    if (net < 0) insights.push({ tone: 'bad', title: 'Spending is above income', text: `You spent ${formatPHP(-net)} more than you received in this period.` });
+    else if (savingsRate !== null && savingsRate >= 20) insights.push({ tone: 'good', title: 'Healthy savings rate', text: `You kept ${savingsRate.toFixed(0)}% of what you received (${formatPHP(net)}).` });
+    else if (savingsRate !== null) insights.push({ tone: 'warn', title: 'Thin margin', text: `You kept only ${savingsRate.toFixed(0)}% of what you received (${formatPHP(net)}). A common goal is 20% or more.` });
+  } else if (spent > 0) {
+    insights.push({ tone: 'info', title: 'No income received yet', text: 'Nothing has been marked as received in this period, so the numbers below only show spending.' });
+  }
+
+  if (prev !== null) {
+    const change = ((spent - prev.spent) / prev.spent) * 100;
+    const progressNote = includesCurrent ? ' The current cycle is still in progress.' : '';
+    if (Math.abs(change) < 5) insights.push({ tone: 'info', title: 'Spending is steady', text: `Within ${Math.abs(change).toFixed(0)}% of the previous ${RANGE_NOUN[range]} (${formatPHP(prev.spent)}).${progressNote}` });
+    else insights.push({ tone: change > 0 ? 'warn' : 'good', title: change > 0 ? 'Spending is up' : 'Spending is down', text: `${Math.abs(change).toFixed(0)}% ${change > 0 ? 'higher' : 'lower'} than the previous ${RANGE_NOUN[range]} (${formatPHP(prev.spent)}).${progressNote}` });
+  }
+
+  if (expenseCats.length > 0 && spent > 0) {
+    const top = expenseCats[0];
+    insights.push({ tone: 'info', title: `${top.name} is your biggest category`, text: `${formatPHP(top.value)}, or ${((top.value / spent) * 100).toFixed(0)}% of everything you spent.` });
+  }
+
+  if (scheduledSpent > 0 && spent > 0) {
+    insights.push({ tone: 'info', title: 'Scheduled vs logged spending', text: `${((scheduledSpent / spent) * 100).toFixed(0)}% of spending (${formatPHP(scheduledSpent)}) comes from your scheduled expenses. The other ${formatPHP(loggedSpent)} was logged by hand.` });
+  }
+
+  if (completed.length >= 1) {
+    const over = completed.filter(r => r.totalExpenses > r.receivedIncome).length;
+    if (over === 0) insights.push({ tone: 'good', title: 'No overspent cycles', text: `Every finished cycle in this period ended with income covering spending (${completed.length} of ${completed.length}).` });
+    else insights.push({ tone: over === completed.length ? 'bad' : 'warn', title: 'Overspent cycles', text: `Spending went above income in ${over} of ${completed.length} finished ${completed.length === 1 ? 'cycle' : 'cycles'}.` });
+  }
+
+  if (completed.length >= 2) {
+    const ranked = [...completed].sort((a, b) => (b.receivedIncome - b.totalExpenses) - (a.receivedIncome - a.totalExpenses));
+    const best = ranked[0];
+    const worst = ranked[ranked.length - 1];
+    insights.push({ tone: 'info', title: 'Best and toughest cycles', text: `Best: ${shortDate(best.startStr)} – ${shortDate(best.endStr)} (${formatPHP(best.receivedIncome - best.totalExpenses)} net). Toughest: ${shortDate(worst.startStr)} – ${shortDate(worst.endStr)} (${formatPHP(worst.receivedIncome - worst.totalExpenses)} net).` });
+  }
+
+  if (days >= 14 && loggedToDate.length >= 5) {
+    const ranked = weekday.filter(w => w.total > 0).sort((a, b) => b.avg - a.avg);
+    if (ranked.length >= 2) {
+      const high = ranked[0];
+      const low = ranked[ranked.length - 1];
+      insights.push({ tone: 'info', title: 'Your priciest weekday', text: `On days you log spending, ${high.day} averages ${formatPHP(high.avg)} while ${low.day} averages ${formatPHP(low.avg)}.` });
+    }
+  }
+
+  const loggedExpenseEntries = expenseEntries.filter(e => e.source === 'manual' && e.date <= asOf);
+  if (loggedExpenseEntries.length > 0) {
+    const biggest = loggedExpenseEntries.reduce((a, b) => (b.amount > a.amount ? b : a));
+    insights.push({ tone: 'info', title: 'Largest logged expense', text: `${formatPHP(biggest.amount)} for "${biggest.label}" on ${longDate(biggest.date)}.` });
+  }
+
+  if (receivedIncomeEntries.length > 0 && incomeCats.length > 0 && income > 0) {
+    const topInc = incomeCats[0];
+    insights.push({ tone: 'info', title: `${topInc.name} is your main income`, text: `${formatPHP(topInc.value)}, or ${((topInc.value / income) * 100).toFixed(0)}% of what you received.` });
+  }
+
+  if (goalContrib > 0 || debtPaid > 0) {
+    const parts = [goalContrib > 0 ? `${formatPHP(goalContrib)} went to savings goals` : '', debtPaid > 0 ? `${formatPHP(debtPaid)} went to debt payments` : ''].filter(Boolean);
+    insights.push({ tone: 'good', title: 'Building your future', text: `${parts.join(' and ')} in this period.` });
+  }
+
+  if (includesCurrent && lastRow.isCurrent) {
+    const left = daysBetween(todayStr, lastRow.endStr) + 1;
+    if (lastRow.available < 0) {
+      insights.push({ tone: 'bad', title: 'Over budget this cycle', text: `You're ${formatPHP(-lastRow.available)} below zero after scheduled expenses. Next cycle would start in the red unless income comes in.` });
+    } else {
+      insights.push({ tone: 'info', title: 'If you stop spending now', text: `You'd carry ${formatPHP(lastRow.available)} into the next cycle. To use it up evenly you could spend about ${formatPHP(lastRow.available / Math.max(1, left))} a day for the remaining ${plural(Math.max(1, left), 'day', 'days')}.` });
+    }
+  }
+
+  if (completed.length > 0) {
+    const missed = round2(sumOf(completed.map(r => r.pendingIncome)));
+    if (missed > 0) insights.push({ tone: 'warn', title: 'Income never marked as received', text: `${formatPHP(missed)} of expected income in finished cycles isn't counted in your balance. Mark it received on the calendar if you did get it.` });
+  }
+
+  return {
+    rows, startStr, endStr, asOf, days, includesCurrent, closingBalance, balanceLabel,
+    income, pendingIncome, spent, scheduledSpent, loggedSpent, net, savingsRate,
+    avgCycleIncome: income / len, avgCycleSpent: spent / len, avgDaily, goalContrib, debtPaid,
+    expenseCats, incomeCats, topItems, weekday, series, prev, insights
   };
+};
 
+const TOOLTIP_STYLE = { borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' };
+
+function InsightIcon({ tone }: { tone: InsightTone }) {
+  if (tone === 'good') return <TrendingUp className="w-4 h-4 shrink-0 mt-0.5" />;
+  if (tone === 'bad') return <TrendingDown className="w-4 h-4 shrink-0 mt-0.5" />;
+  if (tone === 'warn') return <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />;
+  return <Lightbulb className="w-4 h-4 shrink-0 mt-0.5" />;
+}
+
+const INSIGHT_BOX: Record<InsightTone, string> = {
+  good: 'bg-emerald-50 border-emerald-200 text-emerald-800',
+  warn: 'bg-amber-50 border-amber-200 text-amber-800',
+  bad: 'bg-red-50 border-red-200 text-red-800',
+  info: 'bg-slate-50 border-slate-200 text-slate-700'
+};
+
+function ReportStat({ title, value, sub, valueClass = 'text-gray-900' }: { title: string; value: string; sub?: string; valueClass?: string }) {
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
-      <div className="atx-card p-6 rounded-xl shadow-sm">
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
-          <div>
-            <h2 className="text-xl font-bold text-gray-900">Cycle Breakdown</h2>
-            <p className="text-xs text-gray-500 mt-1">Based on viewed cycle: {stats.startStr} to {stats.endStr}</p>
-          </div>
-          <div className="flex bg-gray-100 p-1 rounded-lg">
-            <button onClick={() => setMetricType('expense')} className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${metricType === 'expense' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Expenses</button>
-            <button onClick={() => setMetricType('income')} className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${metricType === 'income' ? 'bg-white shadow-sm text-emerald-600' : 'text-gray-500'}`}>Income</button>
-          </div>
-        </div>
-
-        {chartData.length === 0 ? (
-          <div className="h-64 flex flex-col items-center justify-center text-gray-400 bg-gray-50 rounded-xl border border-dashed border-gray-200">
-            <PieChartIcon className="w-10 h-10 mb-2 opacity-20"/>
-            <p className="text-sm italic">No data to display for this cycle.</p>
-          </div>
-        ) : (
-          <div className="h-72 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={chartData} cx="50%" cy="50%" innerRadius={70} outerRadius={100} paddingAngle={4} dataKey="value">
-                  {chartData.map((_, i) => <Cell key={`cell-${i}`} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}/>
-                <Legend verticalAlign="bottom" height={36} iconType="circle"/>
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-      </div>
-
-      <div className="atx-card p-6 rounded-xl flex justify-between items-center shadow-sm">
-        <div>
-          <h3 className="font-bold text-gray-900">Export All Data</h3>
-          <p className="text-xs text-gray-500">Download complete transaction history (CSV).</p>
-        </div>
-        <button onClick={handleExport} className="bg-gray-900 text-white px-4 py-2 rounded-lg font-bold hover:bg-gray-800 transition-all flex items-center gap-2"><Download className="w-4 h-4" /> CSV</button>
-      </div>
+    <div className="atx-card p-4 rounded-xl shadow-sm">
+      <p className="text-[11px] text-[var(--atx-text-muted)] font-medium">{title}</p>
+      <p className={`text-xl font-bold mt-1 truncate ${valueClass}`}>{value}</p>
+      {sub && <p className="text-[10px] text-gray-400 mt-1 leading-snug">{sub}</p>}
     </div>
   );
 }
 
-function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }: SettingsViewProps) {
+function ChartCard({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) {
+  return (
+    <div className="atx-card p-5 rounded-xl shadow-sm">
+      <h3 className="font-bold text-gray-900 text-sm">{title}</h3>
+      {subtitle && <p className="text-[11px] text-gray-500 mt-0.5">{subtitle}</p>}
+      <div className="mt-4">{children}</div>
+    </div>
+  );
+}
+
+function InsightsView({ cycles, viewedStartStr, cyclesPerMonth }: InsightsViewProps) {
+  const [range, setRange] = useState<InsightRange>('1m');
+  const [metricType, setMetricType] = useState<'expense' | 'income'>('expense');
+  const todayStr = toYYYYMMDD(new Date());
+
+  const report = useMemo(
+    () => buildReport(cycles, range, viewedStartStr, cyclesPerMonth, todayStr),
+    [cycles, range, viewedStartStr, cyclesPerMonth, todayStr]
+  );
+
+  const pieData = report ? (metricType === 'expense' ? report.expenseCats : report.incomeCats) : [];
+  const pieTotal = sumOf(pieData.map(p => p.value));
+  const hasData = !!report && report.rows.some(r => r.entries.length > 0);
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-300">
+      <div className="atx-card p-5 rounded-xl shadow-sm">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900">Financial Report</h2>
+            {report && (
+              <p className="text-xs text-gray-500 mt-1">
+                {longDate(report.startStr)} – {longDate(report.endStr)} · {plural(report.rows.length, 'cycle', 'cycles')}
+                {report.includesCurrent ? ' · includes the current cycle in progress' : ''}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-1 bg-gray-100 p-1 rounded-lg">
+            {RANGE_OPTIONS.map(opt => (
+              <button key={opt.id} onClick={() => setRange(opt.id)} className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${range === opt.id ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500 hover:text-gray-700'}`}>{opt.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {!report || !hasData ? (
+        <div className="atx-card p-12 rounded-xl shadow-sm flex flex-col items-center justify-center text-gray-400">
+          <PieChartIcon className="w-10 h-10 mb-2 opacity-20"/>
+          <p className="text-sm italic">No data to display for this period.</p>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+            <ReportStat title="Income received" value={formatPHP(report.income)} valueClass="text-emerald-600" sub={report.pendingIncome > 0 ? `+${formatPHP(report.pendingIncome)} still expected` : `${formatPHP(report.avgCycleIncome)} per cycle`} />
+            <ReportStat title="Total spent" value={formatPHP(report.spent)} valueClass="text-rose-600" sub={`${formatPHP(report.avgCycleSpent)} per cycle`} />
+            <ReportStat title="Net (income − spent)" value={formatPHP(report.net)} valueClass={report.net < 0 ? 'text-red-600' : 'text-gray-900'} sub="Before carry-over" />
+            <ReportStat title="Savings rate" value={report.savingsRate === null ? '—' : `${report.savingsRate.toFixed(0)}%`} valueClass={report.savingsRate !== null && report.savingsRate < 0 ? 'text-red-600' : 'text-gray-900'} sub="Share of income kept" />
+            <ReportStat title="Avg daily spend" value={formatPHP(report.avgDaily)} sub={report.days > 0 ? `Over ${plural(report.days, 'day', 'days')} so far` : 'No days elapsed yet'} />
+            <ReportStat title={report.balanceLabel} value={formatPHP(report.closingBalance)} valueClass={report.closingBalance < 0 ? 'text-red-600' : 'text-blue-600'} sub="Includes carry-over" />
+          </div>
+
+          {report.insights.length > 0 && (
+            <div className="atx-card p-5 rounded-xl shadow-sm">
+              <h3 className="font-bold text-gray-900 text-sm mb-3 flex items-center gap-2"><Lightbulb className="w-4 h-4 text-amber-500"/> Insights</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {report.insights.map((item, i) => (
+                  <div key={i} className={`p-3 rounded-lg border flex items-start gap-2.5 ${INSIGHT_BOX[item.tone]}`}>
+                    <InsightIcon tone={item.tone} />
+                    <div>
+                      <p className="text-xs font-bold">{item.title}</p>
+                      <p className="text-xs mt-0.5 opacity-90">{item.text}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <ChartCard title="Income vs spending" subtitle="Received income and total spending for each cycle">
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={report.series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <Legend iconType="circle" />
+                    <Bar dataKey="income" name="Income" fill="#10b981" radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="spent" name="Spent" fill="#ef4444" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+
+            <ChartCard title="Balance over time" subtitle="Available balance at the end of each cycle, including carry-over">
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={report.series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="4 4" />
+                    <Area type="monotone" dataKey="balance" name="Balance" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.15} strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+
+            <ChartCard title={metricType === 'expense' ? 'Where your money went' : 'Where your income came from'} subtitle={metricType === 'expense' ? 'Logged and scheduled expenses by category' : 'Received income by category'}>
+              <div className="flex bg-gray-100 p-1 rounded-lg w-fit mb-2">
+                <button onClick={() => setMetricType('expense')} className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${metricType === 'expense' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Expenses</button>
+                <button onClick={() => setMetricType('income')} className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${metricType === 'income' ? 'bg-white shadow-sm text-emerald-600' : 'text-gray-500'}`}>Income</button>
+              </div>
+              {pieData.length === 0 ? (
+                <div className="h-64 flex flex-col items-center justify-center text-gray-400 bg-gray-50 rounded-xl border border-dashed border-gray-200">
+                  <PieChartIcon className="w-10 h-10 mb-2 opacity-20"/>
+                  <p className="text-sm italic">No {metricType} data for this period.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="h-64 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={3} dataKey="value">
+                          {pieData.map((_, i) => <Cell key={`cell-${i}`} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+                        </Pie>
+                        <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE}/>
+                        <Legend verticalAlign="bottom" height={36} iconType="circle"/>
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="mt-2 space-y-1.5">
+                    {pieData.slice(0, 6).map((c, i) => (
+                      <div key={c.name} className="flex items-center justify-between text-xs">
+                        <span className="flex items-center gap-2 text-gray-600"><span className="w-2 h-2 rounded-full" style={{ backgroundColor: CHART_COLORS[i % CHART_COLORS.length] }}></span>{c.name}</span>
+                        <span className="font-semibold text-gray-800">{formatPHP(c.value)} <span className="text-gray-400 font-normal">· {pieTotal > 0 ? ((c.value / pieTotal) * 100).toFixed(0) : 0}%</span></span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </ChartCard>
+
+            <ChartCard title="Biggest expenses" subtitle="Top items by total amount (repeating items are combined)">
+              {report.topItems.length === 0 ? (
+                <p className="text-sm italic text-gray-400 py-10 text-center">No expenses in this period.</p>
+              ) : (
+                <div className="space-y-3">
+                  {report.topItems.map(item => {
+                    const widthPct = (item.value / report.topItems[0].value) * 100;
+                    return (
+                      <div key={item.name}>
+                        <div className="flex justify-between text-xs mb-1">
+                          <span className="font-semibold text-gray-700 truncate pr-2">{item.name}{item.count > 1 ? <span className="text-gray-400 font-normal"> ×{item.count}</span> : null}</span>
+                          <span className="font-bold text-rose-600 shrink-0">{formatPHP(item.value)}</span>
+                        </div>
+                        <div className="w-full bg-gray-100 rounded-full h-1.5">
+                          <div className="bg-rose-400 h-1.5 rounded-full" style={{ width: `${widthPct}%` }}></div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </ChartCard>
+
+            <ChartCard title="Scheduled vs logged spending" subtitle="Fixed expenses you set up compared with what you logged by hand">
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={report.series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <Legend iconType="circle" />
+                    <Bar dataKey="scheduled" name="Scheduled" stackId="spend" fill="#94a3b8" />
+                    <Bar dataKey="logged" name="Logged" stackId="spend" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+
+            <ChartCard title="Logged spending by weekday" subtitle={report.days > 0 ? 'Average you logged per day, counting only days that have happened' : 'No days have elapsed yet'}>
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={report.weekday} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="day" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <Bar dataKey="avg" name="Average" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+          </div>
+
+          <div className="atx-card rounded-xl shadow-sm overflow-hidden">
+            <div className="px-5 py-3 border-b border-[var(--atx-border)] bg-gray-50">
+              <h3 className="font-bold text-gray-900 text-sm">Cycle by cycle</h3>
+              <p className="text-[11px] text-gray-500 mt-0.5">Balance = Carried over + Income − Spent. Projected cycles use expected income.</p>
+            </div>
+            <div className="max-h-96 overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-white sticky top-0 text-[11px] text-gray-400">
+                  <tr>
+                    <th className="text-left font-semibold px-5 py-2">Cycle</th>
+                    <th className="text-right font-semibold px-2 py-2">Carried over</th>
+                    <th className="text-right font-semibold px-2 py-2">Income</th>
+                    <th className="text-right font-semibold px-2 py-2">Spent</th>
+                    <th className="text-right font-semibold px-2 py-2">Net</th>
+                    <th className="text-right font-semibold px-5 py-2">Balance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...report.series].reverse().map(p => (
+                    <tr key={p.fullLabel} className="border-t border-gray-100">
+                      <td className="px-5 py-2 text-gray-700 whitespace-nowrap">
+                        {p.fullLabel}
+                        {p.status && <span className="ml-2 text-[10px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded-full">{p.status}</span>}
+                      </td>
+                      <td className={`px-2 py-2 text-right ${p.carryIn < 0 ? 'text-red-500' : 'text-gray-500'}`}>{formatPHP(p.carryIn)}</td>
+                      <td className="px-2 py-2 text-right text-emerald-600">{formatPHP(p.income)}</td>
+                      <td className="px-2 py-2 text-right text-rose-600">{formatPHP(p.spent)}</td>
+                      <td className={`px-2 py-2 text-right font-semibold ${p.net < 0 ? 'text-red-600' : 'text-gray-800'}`}>{formatPHP(p.net)}</td>
+                      <td className={`px-5 py-2 text-right font-bold ${p.balance < 0 ? 'text-red-600' : 'text-blue-600'}`}>{formatPHP(p.balance)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-400 px-1">
+            Spending for the current cycle includes scheduled expenses that are still due. Looking for your CSV export? It's now in Config.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+// Wraps a text cell for CSV. Quotes are escaped, and a leading = + - @ is neutralised so spreadsheets don't run it as a formula.
+const csvText = (value: unknown) => {
+  let s = String(value ?? '');
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules, expenses, incomes }: SettingsViewProps) {
   const [localConfig, setLocalConfig] = useState<AppSettings>(settings);
   const isDirty = JSON.stringify(localConfig) !== JSON.stringify(settings);
   useEffect(() => { if (!isDirty) setLocalConfig(settings); }, [settings, isDirty]);
@@ -1278,6 +2072,22 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }:
   const removeRule = async (id: string, type: 'income' | 'expense') => {
     if (!user || !db) return;
     await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, type === 'income' ? 'incomeRules' : 'fixedExpenses', id));
+  };
+
+  const handleExport = () => {
+    const records: { date: string; line: string }[] = [];
+    expenses.forEach(e => records.push({ date: e.date, line: ['Expense', e.date, csvText(e.description || e.name || ''), csvText(e.category || 'Other'), String(num(e.amount)), 'Spent', csvText(e.linkedType ? `${e.linkedType === 'goal' ? 'Savings goal' : 'Debt'} payment` : '')].join(',') }));
+    incomes.forEach(i => records.push({ date: i.date, line: ['Income', i.date, csvText(i.name || i.description || ''), csvText(i.category || 'Other'), String(num(i.amount)), i.isReceived === false ? 'Expected' : 'Received', csvText(i.ruleId ? 'Scheduled income' : '')].join(',') }));
+    records.sort((a, b) => a.date.localeCompare(b.date));
+
+    const csv = ['Type,Date,Description,Category,Amount,Status,Note', ...records.map(r => r.line)].join('\r\n');
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Ataraxia_Export_${toYYYYMMDD(new Date())}.csv`;
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -1396,6 +2206,15 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules }:
           </div>
         </section>
       </div>
+
+      {/* Export */}
+      <section className="atx-card p-5 rounded-xl shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h3 className="text-lg font-bold">Export All Data</h3>
+          <p className="text-xs text-gray-500">Download your complete transaction history (CSV), {expenses.length + incomes.length} records.</p>
+        </div>
+        <button onClick={handleExport} className="bg-gray-900 text-white px-4 py-2 rounded-lg font-bold hover:bg-gray-800 transition-all flex items-center justify-center gap-2"><Download className="w-4 h-4" /> CSV</button>
+      </section>
     </div>
   );
 }
