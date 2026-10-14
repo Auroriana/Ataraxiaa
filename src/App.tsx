@@ -25,17 +25,21 @@ import {
 } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
-declare const __firebase_config: string | undefined;
-declare const __app_id: string | undefined;
-declare const __initial_auth_token: string | undefined;
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+};
 
-type Frequency = 'daily' | 'monthly';
-type Tab = 'calendar' | 'savings' | 'insights' | 'settings';
-type LinkedType = 'goal' | 'debt' | null;
-type ExceptionType = 'absent' | 'expense_skip' | 'income_skip';
-type InsightRange = 'cycle' | '1m' | '3m' | '6m' | '1y' | 'all';
-type InsightTone = 'good' | 'warn' | 'bad' | 'info';
-type HealthState = 'safe' | 'caution' | 'danger';
+const firebaseReady = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
+const app = firebaseReady ? initializeApp(firebaseConfig) : null;
+const auth = app ? getAuth(app) : null;
+const db = app ? getFirestore(app) : null;
+const appId = 'ataraxia'; 
+const googleProvider = new GoogleAuthProvider();
 
 interface WorkOverride { start: string; end: string; days: number[]; }
 interface AppSettings {
@@ -681,9 +685,20 @@ export default function App() {
   const isViewingFutureCycle = viewedStartStr > todayStartStr;
   const daysLeft = isViewingCurrentCycle ? Math.max(1, daysBetween(toYYYYMMDD(new Date()), cycleStats.endStr) + 1) : 0;
 
+if (!firebaseReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500 p-6 text-center">
+        <div>
+          <p className="font-bold text-gray-700 mb-1">Firebase isn't configured</p>
+          <p className="text-sm max-w-sm">Add your Firebase project's credentials as VITE_FIREBASE_* environment variables, then restart the dev server.</p>
+        </div>
+      </div>
+    );
+  }
+
   if (authLoading) return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Loading Ataraxia...</div>;
 
-  if (!user && app) {
+  if (!user) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-center p-6 gap-4">
         <Briefcase className="w-10 h-10 text-emerald-500" />
