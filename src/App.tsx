@@ -16,7 +16,7 @@ import {
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+  getAuth, signInAnonymously, onAuthStateChanged,
   signInWithPopup, linkWithPopup, GoogleAuthProvider, signOut
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
@@ -25,21 +25,14 @@ import {
 } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
-const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
-};
-
-const firebaseReady = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
-const app = firebaseReady ? initializeApp(firebaseConfig) : null;
-const auth = app ? getAuth(app) : null;
-const db = app ? getFirestore(app) : null;
-const appId = 'ataraxia'; 
-const googleProvider = new GoogleAuthProvider();
+// --- TYPE DEFINITIONS ---
+type Frequency = 'daily' | 'monthly';
+type Tab = 'calendar' | 'savings' | 'insights' | 'settings';
+type LinkedType = 'goal' | 'debt' | null;
+type ExceptionType = 'absent' | 'expense_skip' | 'income_skip';
+type InsightRange = 'cycle' | '1m' | '3m' | '6m' | '1y' | 'all';
+type InsightTone = 'good' | 'warn' | 'bad' | 'info';
+type HealthState = 'safe' | 'caution' | 'danger';
 
 interface WorkOverride { start: string; end: string; days: number[]; }
 interface AppSettings {
@@ -54,21 +47,20 @@ interface ExceptionEntry { id: string; date: string; type: ExceptionType; target
 interface SavingsGoal { id: string; name: string; targetAmount: number | string; createdAt?: string; }
 interface Debt { id: string; name: string; initialAmount: number | string; createdAt?: string; }
 
-// One line of the unified money ledger (a logged record or a scheduled occurrence).
 interface LedgerEntry {
   date: string; kind: 'income' | 'expense'; amount: number; category: string; label: string;
   source: 'manual' | 'scheduled';
-  received: boolean; // income: money actually in hand. Expenses are always "received" (spent/committed).
+  received: boolean;
   linkedType: LinkedType;
 }
-// Everything we know about one pay cycle, including what was carried in from the cycle before it.
+
 interface CycleRow {
   index: number; startStr: string; endStr: string;
   carryIn: number;
   receivedIncome: number; pendingIncome: number; expectedIncome: number;
   scheduledExpenses: number; manualExpenses: number; totalExpenses: number;
   closingActual: number; closingProjected: number;
-  available: number; // what the dashboard shows as Available (actual for past/current, projected for future)
+  available: number;
   isCurrent: boolean; isFuture: boolean; projectionDepth: number;
   entries: LedgerEntry[];
 }
@@ -81,7 +73,7 @@ interface CycleStats {
 }
 interface ScheduleContext {
   settings: AppSettings;
-  ruleStarts: Record<string, string>; // rule id -> first date the rule applies (start of the cycle it was created in)
+  ruleStarts: Record<string, string>;
   skips: Set<string>;
   absences: Set<string>;
 }
@@ -162,7 +154,6 @@ const RANGE_OPTIONS: { id: InsightRange; label: string }[] = [
   { id: '1y', label: '1 Year' },
   { id: 'all', label: 'All Time' },
 ];
-
 
 const THEME_STYLES = `
   :root {
@@ -320,7 +311,6 @@ const makeSchedule = (settings: AppSettings, fixedExpenses: FixedExpense[], inco
     if (!rule.createdAt) return;
     const created = new Date(rule.createdAt);
     if (isNaN(created.getTime())) return;
-    // A rule counts for the whole cycle it was created in, but not for earlier cycles.
     ruleStarts[rule.id] = toYYYYMMDD(getActivePeriod(created, settings.cutoffs).start);
   });
   const skips = new Set<string>();
@@ -335,7 +325,6 @@ const makeSchedule = (settings: AppSettings, fixedExpenses: FixedExpense[], inco
 const isWorkingDay = (sc: ScheduleContext, dateStr: string, dateObj: Date) =>
   getBaseWorkDay(dateStr, dateObj, sc.settings) && !sc.absences.has(dateStr);
 
-// A monthly rule on the 29th/30th/31st lands on the last day of shorter months instead of being skipped.
 const ruleHitsDay = (frequency: Frequency, ruleDate: number | string | null, d: Date) => {
   if (frequency === 'daily') return true;
   const day = Number(ruleDate);
@@ -344,14 +333,12 @@ const ruleHitsDay = (frequency: Frequency, ruleDate: number | string | null, d: 
   return d.getDate() === Math.min(day, lastDay);
 };
 
-// Is the rule due on this date at all (ignoring skips and absences)? Used to list it in the day view.
 const ruleScheduledOn = (sc: ScheduleContext, rule: ScheduledRule, dateStr: string, d: Date) => {
   const start = sc.ruleStarts[rule.id];
   if (start && dateStr < start) return false;
   return ruleHitsDay(rule.frequency, rule.date, d);
 };
 
-// Is the rule actually in effect on this date (not skipped, and the work-day requirement is met)?
 const ruleLiveOn = (sc: ScheduleContext, rule: ScheduledRule, dateStr: string, d: Date, skipType: ExceptionType) => {
   if (!ruleScheduledOn(sc, rule, dateStr, d)) return false;
   if (sc.skips.has(skipKey(skipType, rule.id, dateStr))) return false;
@@ -360,7 +347,7 @@ const ruleLiveOn = (sc: ScheduleContext, rule: ScheduledRule, dateStr: string, d
 };
 
 // ---------------------------------------------------------------------------
-// Ledger + cycle engine (single source of truth for every number on screen)
+// Ledger + cycle engine
 // ---------------------------------------------------------------------------
 const buildCycleEntries = (startStr: string, endStr: string, sc: ScheduleContext, src: LedgerSources, receivedRuleDays: Set<string>): LedgerEntry[] => {
   const entries: LedgerEntry[] = [];
@@ -373,7 +360,6 @@ const buildCycleEntries = (startStr: string, endStr: string, sc: ScheduleContext
     });
     src.incomeRules.forEach(inc => {
       if (!ruleLiveOn(sc, inc, ds, d, 'income_skip')) return;
-      // Once marked received, the received record represents it. Don't count it twice.
       if (receivedRuleDays.has(`${inc.id}|${ds}`)) return;
       entries.push({ date: ds, kind: 'income', amount: num(inc.amount), category: inc.category || 'Other', label: inc.name, source: 'scheduled', received: false, linkedType: null });
     });
@@ -397,14 +383,6 @@ const emptyRow = (startStr: string, endStr: string): CycleRow => ({
   isCurrent: false, isFuture: false, projectionDepth: 0, entries: []
 });
 
-/**
- * Builds every cycle from the first one with any data up to the later of (today's cycle, the viewed cycle).
- *
- *  - Past + current cycles:  Available = Carried Over + Received income - Total spent
- *    and the cycle's leftover (positive or negative) becomes the next cycle's Carried Over.
- *  - The cycle right after today's:  Carried Over = today's Available (what you have if you stop spending now).
- *  - Cycles further ahead:  Carried Over = the previous cycle's projected balance (Expected income - Spent).
- */
 const buildCycles = (src: LedgerSources, sc: ScheduleContext, todayStartStr: string, viewedStartStr: string): CycleRow[] => {
   const cutoffs = sc.settings.cutoffs;
 
@@ -470,7 +448,6 @@ const buildCycles = (src: LedgerSources, sc: ScheduleContext, todayStartStr: str
   return rows;
 };
 
-// Budget status = what's left (Available, including carry-over) as a share of this cycle's own earnings.
 const evaluateHealth = (available: number, earnings: number): { percent: number; state: HealthState } => {
   const percent = earnings > 0 ? (available / earnings) * 100 : 0;
   if (available < 0) return { percent, state: 'danger' };
@@ -491,7 +468,6 @@ const rowToStats = (row: CycleRow): CycleStats => {
   };
 };
 
-// Totals for one calendar day, matching exactly what the cycle engine counts.
 const getDayFlows = (sc: ScheduleContext, fixedExpenses: FixedExpense[], incomeRules: IncomeRule[], expenses: Expense[], incomes: Income[], dateStr: string, d: Date): DayFlows => {
   const flows: DayFlows = { scheduledExpense: 0, loggedExpense: 0, scheduledIncome: 0, loggedIncome: 0, pendingIncome: 0, hasLoggedExpense: false };
   fixedExpenses.forEach(exp => {
@@ -516,26 +492,36 @@ const getDayFlows = (sc: ScheduleContext, fixedExpenses: FixedExpense[], incomeR
   return flows;
 };
 
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const app = Object.keys(firebaseConfig).length > 0 ? initializeApp(firebaseConfig) : null;
+// --- FIREBASE INIT (Using VITE_ env vars) ---
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+};
+
+const firebaseReady = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
+const app = firebaseReady ? initializeApp(firebaseConfig) : null;
 const auth = app ? getAuth(app) : null;
 const db = app ? getFirestore(app) : null;
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const appId = 'ataraxia'; 
 const googleProvider = new GoogleAuthProvider();
+
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
   const autoAnonRef = useRef(true);
-  const [activeTab, setActiveTab] = useState<Tab>('calendar'); // 'calendar', 'savings', 'insights', 'settings'
+  const [activeTab, setActiveTab] = useState<Tab>('calendar');
   
   const [settings, setSettings] = useState<AppSettings>({
     cutoffs: [13, 29], defaultWorkDays: [1, 2, 3, 4, 5], workOverrides: [],
     healthThresholds: { safe: 50, caution: 20, danger: 20 }
   });
   
-  // Collections State
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [fixedExpenses, setFixedExpenses] = useState<FixedExpense[]>([]);
   const [incomeRules, setIncomeRules] = useState<IncomeRule[]>([]);
@@ -544,29 +530,18 @@ export default function App() {
   const [savingsGoals, setSavingsGoals] = useState<SavingsGoal[]>([]);
   const [debts, setDebts] = useState<Debt[]>([]);
   
-  // Navigation State
   const [viewedCycleAnchor, setViewedCycleAnchor] = useState<Date>(new Date()); 
   const [calendarMonth, setCalendarMonth] = useState<Date>(new Date()); 
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedDateStr, setSelectedDateStr] = useState<string | null>(null);
 
-  // Calendar view toggles
   const [showIncome, setShowIncome] = useState<boolean>(true);
   const [showExpenses, setShowExpenses] = useState<boolean>(true);
 
   useEffect(() => {
     if (!auth) { setAuthLoading(false); return; }
     
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        }
-      } catch (err) { console.error("Auth error:", err); }
-    };
-    initAuth();
-
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
       setUser(firebaseUser);
       if (firebaseUser) {
@@ -641,7 +616,6 @@ export default function App() {
   const viewedStartStr = toYYYYMMDD(viewedCycle.start);
   const cyclesPerMonth = Math.max(1, new Set(settings.cutoffs && settings.cutoffs.length > 0 ? settings.cutoffs : [13, 29]).size);
 
-  // Every number on the dashboard, savings planner and insights comes from this one chain of cycles.
   const schedule = useMemo(() => makeSchedule(settings, fixedExpenses, incomeRules, exceptions), [settings, fixedExpenses, incomeRules, exceptions]);
   const cycles = useMemo(
     () => buildCycles({ expenses, incomes, fixedExpenses, incomeRules }, schedule, todayStartStr, viewedStartStr),
@@ -653,7 +627,6 @@ export default function App() {
     [viewedRow, viewedStartStr, viewedCycle]
   );
 
-  // Scheduled income from finished cycles that was never marked as received (so it isn't in the carry-over).
   const missedIncome = useMemo(
     () => round2(cycles.filter(c => !c.isCurrent && !c.isFuture).reduce((sum, c) => sum + c.pendingIncome, 0)),
     [cycles]
@@ -685,7 +658,7 @@ export default function App() {
   const isViewingFutureCycle = viewedStartStr > todayStartStr;
   const daysLeft = isViewingCurrentCycle ? Math.max(1, daysBetween(toYYYYMMDD(new Date()), cycleStats.endStr) + 1) : 0;
 
-if (!firebaseReady) {
+  if (!firebaseReady) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500 p-6 text-center">
         <div>
@@ -763,7 +736,6 @@ if (!firebaseReady) {
                 <span className="text-sm font-bold text-rose-700">{formatPHP(globalDebtTotal)}</span>
               </div>
 
-              {/* Cycle Navigation */}
               <div className="flex flex-col sm:flex-row justify-between items-center bg-white p-3 rounded-xl shadow-sm border border-[var(--atx-border)] gap-3">
                 <button onClick={handlePrevCycle} className="w-full sm:w-auto flex justify-center items-center gap-1 text-sm font-semibold text-gray-600 hover:text-[var(--atx-accent)] hover:bg-gray-50 px-3 py-1.5 rounded-lg transition-colors">
                   <ChevronLeft className="w-4 h-4" /> Prev Cycle
@@ -997,7 +969,7 @@ function MergedCalendarView({
           const isTodayCycle = dateStr >= todayStart && dateStr <= todayEnd;
           const isFuture = dateStr > todayStr;
           
-          let bgClass = 'bg-white opacity-50 grayscale-[30%]'; // Default out-of-cycle
+          let bgClass = 'bg-white opacity-50 grayscale-[30%]';
           if (isViewedCycle) {
              bgClass = isTodayCycle ? 'bg-[var(--atx-today-band)]' : 'bg-[var(--atx-view-band)]';
           }
@@ -1045,7 +1017,6 @@ function MergedCalendarView({
   );
 }
 
-
 function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycles, cutoffs, todayStartStr, cyclesPerMonth }: SavingsDebtViewProps) {
   const [subTab, setSubTab] = useState<'overview' | 'split'>('overview');
   const [goalName, setGoalName] = useState('');
@@ -1072,7 +1043,6 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
     await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, coll, id));
   };
 
-  // Compute progress/balances based on linked expenses
   const goalsWithProgress: GoalWithProgress[] = savingsGoals.map(g => {
     const saved = expenses.filter(e => e.linkedType === 'goal' && e.linkedTo === g.id).reduce((s, e) => s + Number(e.amount), 0);
     return { ...g, saved, pct: Math.min(100, (saved / (Number(g.targetAmount) || 1)) * 100) };
@@ -1095,7 +1065,6 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
         <SplitPlanner goals={goalsWithProgress} cycles={cycles} cutoffs={cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth} />
       ) : (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in slide-in-from-bottom-4 duration-300">
-      {/* Goals Section */}
       <div className="atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400">
         <h2 className="text-lg font-bold flex items-center gap-2 mb-4 text-emerald-800"><Target className="w-5 h-5"/> Savings Goals</h2>
         <form onSubmit={handleAddGoal} className="flex flex-col sm:flex-row gap-2 mb-6 bg-emerald-50 p-3 rounded-lg border border-emerald-100">
@@ -1127,7 +1096,6 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
         </div>
       </div>
 
-      {/* Debts Section */}
       <div className="atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-rose-400">
         <h2 className="text-lg font-bold flex items-center gap-2 mb-4 text-rose-800"><CreditCard className="w-5 h-5"/> Debts & Loans</h2>
         <form onSubmit={handleAddDebt} className="flex flex-col sm:flex-row gap-2 mb-6 bg-rose-50 p-3 rounded-lg border border-rose-100">
@@ -1165,7 +1133,7 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
 }
 
 function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }: SplitPlannerProps) {
-  const [source, setSource] = useState<string>('custom'); // a goal id, or 'custom'
+  const [source, setSource] = useState<string>('custom');
   const [customName, setCustomName] = useState('');
   const [customAmount, setCustomAmount] = useState('');
   const [unit, setUnit] = useState<'cycles' | 'months'>('cycles');
@@ -1184,7 +1152,6 @@ function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }:
   const perCycle = amount / totalCycles;
   const perMonth = perCycle * cyclesPerMonth;
 
-  // Split in whole centavos so the schedule always adds up exactly to the target.
   const schedule = useMemo(() => {
     const first = getActivePeriod(parseYMD(todayStartStr), cutoffs);
     let anchor = startNext ? addDays(first.end, 1) : first.start;
@@ -1203,7 +1170,6 @@ function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }:
     return rows;
   }, [amount, totalCycles, startNext, todayStartStr, cutoffs]);
 
-  // What you typically have left over per finished cycle (income actually received minus spending, ignoring goal contributions).
   const avgSurplus = useMemo(() => {
     const finished = cycles.filter(c => !c.isCurrent && !c.isFuture && c.entries.length > 0).slice(-6);
     if (finished.length === 0) return null;
@@ -1367,18 +1333,15 @@ function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }:
   );
 }
 
-
-// Reusing logic from the updated constraints, merging expense and income inputs into one modal interface
-
 function DayDetailsModal({ 
   isOpen, onClose, dateStr, expenses, fixedExpenses, incomes, incomeRules, exceptions, schedule,
   savingsGoals, debts, user, db, appId 
 }: DayDetailsModalProps) {
-  const [subTab, setSubTab] = useState<'expense' | 'income'>('expense'); // 'expense' or 'income'
+  const [subTab, setSubTab] = useState<'expense' | 'income'>('expense');
   const [amount, setAmount] = useState('');
   const [descName, setDescName] = useState('');
   const [category, setCategory] = useState('');
-  const [linkedTo, setLinkedTo] = useState(''); // "goal_id" or "debt_id" or ""
+  const [linkedTo, setLinkedTo] = useState('');
   
   const [confirmData, setConfirmData] = useState<ConfirmData | null>(null); 
 
@@ -1445,7 +1408,6 @@ function DayDetailsModal({
         }
       } else if (confirmData.action === 'markReceived') {
         const rule = confirmData.data;
-        // Guard against a double tap creating a second "received" record (which would double the income).
         const alreadyReceived = incomes.some(i => i.ruleId === rule.id && i.date === dateStr && i.isReceived !== false);
         if (!alreadyReceived) {
           await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'incomes'), {
@@ -1484,7 +1446,6 @@ function DayDetailsModal({
         <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose}></div>
         
         <div className={`relative bg-gray-50 rounded-2xl shadow-2xl w-full max-w-xl flex flex-col max-h-[95vh] transition-transform duration-300 ease-out transform ${isOpen ? 'scale-100 translate-y-0' : 'scale-95 translate-y-8'}`}>
-          {/* Header */}
           <div className="flex justify-between items-center p-4 border-b border-gray-200 bg-white rounded-t-2xl">
             <div>
               <h3 className="font-bold text-gray-900 text-lg">{dateObj.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</h3>
@@ -1509,7 +1470,6 @@ function DayDetailsModal({
           </div>
 
           <div className="p-4 overflow-y-auto space-y-6 flex-1 bg-gray-50">
-            {/* Expected / Scheduled Items */}
             <div>
               <h4 className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">
                 {subTab === 'expense' ? 'Automated Expenses' : 'Expected Income'}
@@ -1555,7 +1515,6 @@ function DayDetailsModal({
               )}
             </div>
 
-            {/* Manual Entries */}
             <div>
               <h4 className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-3">Logged Records</h4>
               <div className="space-y-2">
@@ -1577,7 +1536,6 @@ function DayDetailsModal({
               </div>
             </div>
 
-            {/* Add New Form */}
             <form onSubmit={handleAdd} className={`p-4 rounded-xl border shadow-sm ${subTab === 'expense' ? 'bg-rose-50 border-rose-200' : 'bg-emerald-50 border-emerald-200'}`}>
               <h4 className={`text-sm font-bold mb-3 flex items-center gap-2 ${subTab === 'expense' ? 'text-rose-700' : 'text-emerald-700'}`}>
                 <Plus className="w-4 h-4"/> Log New {subTab === 'expense' ? 'Expense' : 'Income'}
@@ -1662,7 +1620,6 @@ const buildReport = (cycles: CycleRow[], range: InsightRange, viewedStartStr: st
     endIdx = curIdx;
     const span = range === 'all' ? curIdx + 1 : RANGE_MONTHS[range] * cyclesPerMonth;
     startIdx = Math.max(0, curIdx - span + 1);
-    // Don't pad the report with empty cycles from before you started using the app.
     if (firstActive >= 0) startIdx = Math.max(startIdx, Math.min(firstActive, curIdx));
   }
 
@@ -1685,7 +1642,6 @@ const buildReport = (cycles: CycleRow[], range: InsightRange, viewedStartStr: st
   const expenseEntries = entries.filter(e => e.kind === 'expense');
   const receivedIncomeEntries = entries.filter(e => e.kind === 'income' && e.received);
 
-  // "Per day" figures only look at days that have already happened.
   const asOf = endStr < todayStr ? endStr : todayStr;
   const days = asOf >= startStr ? daysBetween(startStr, asOf) + 1 : 0;
   const spentToDate = sumOf(expenseEntries.filter(e => e.date <= asOf).map(e => e.amount));
@@ -1724,7 +1680,6 @@ const buildReport = (cycles: CycleRow[], range: InsightRange, viewedStartStr: st
     status: r.isFuture ? 'Projected' : r.isCurrent ? 'In progress' : ''
   }));
 
-  // Compare with the window of the same length right before this one.
   let prev: ReportData['prev'] = null;
   if (range !== 'all' && startIdx - len >= 0) {
     const prevRows = cycles.slice(startIdx - len, startIdx);
@@ -1736,7 +1691,6 @@ const buildReport = (cycles: CycleRow[], range: InsightRange, viewedStartStr: st
   const closingBalance = lastRow.available;
   const balanceLabel = lastRow.isCurrent ? 'Available now' : lastRow.isFuture ? 'Projected balance' : 'Balance at end';
 
-  // ---- Written insights ----
   const insights: ReportInsight[] = [];
   const completed = rows.filter(r => !r.isCurrent && !r.isFuture);
 
@@ -2093,8 +2047,6 @@ function InsightsView({ cycles, viewedStartStr, cyclesPerMonth }: InsightsViewPr
   );
 }
 
-
-// Wraps a text cell for CSV. Quotes are escaped, and a leading = + - @ is neutralised so spreadsheets don't run it as a formula.
 const csvText = (value: unknown) => {
   let s = String(value ?? '');
   if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
@@ -2227,7 +2179,6 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules, e
         </div>
       </section>
 
-      {/* Rules Manager */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <section className="atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400">
           <h3 className="text-lg font-bold mb-4 flex items-center gap-2"><HandCoins className="w-5 h-5 text-emerald-500"/> Scheduled Income</h3>
@@ -2297,7 +2248,6 @@ function SettingsView({ settings, user, db, appId, fixedExpenses, incomeRules, e
         </section>
       </div>
 
-      {/* Export */}
       <section className="atx-card p-5 rounded-xl shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-bold">Export All Data</h3>
