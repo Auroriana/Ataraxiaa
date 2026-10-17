@@ -22,6 +22,8 @@ import {
 } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
+import icon from './assets/icon.png';
+
 declare const __firebase_config: string | undefined;
 declare const __app_id: string | undefined;
 declare const __initial_auth_token: string | undefined;
@@ -362,7 +364,7 @@ export default function App() {
         <header className="atx-card border-b sticky top-0 z-10 shadow-sm">
           <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
             <h1 className="text-xl font-bold flex items-center gap-2">
-              <Briefcase className="w-6 h-6 text-[var(--atx-accent)] transition-colors" /> Ataraxia
+              <img src={icon} alt="App Logo" className="w-8 h-8" /> Ataraxia
             </h1>
             
             <div className="hidden sm:flex items-center gap-3">
