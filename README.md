@@ -69,3 +69,28 @@ Ataraxia/
 ├── tsconfig.json
 ├── vite.config.ts
 └── README.md
+```
+
+## Existing saved budgets
+
+The app reads data beneath `artifacts/{namespace}/users/{Firebase UID}`. An
+earlier release used `default-app-id`; a later release changed it to `ataraxia`
+without moving the records. On sign-in, the app now checks both locations for
+the same user, opens the original budget if present, and offers a budget
+selector if both locations contain data. All writes use the selected location;
+records are not copied, merged, or deleted during discovery.
+
+For an older deployment that supplied a custom `__app_id`, set
+`VITE_FIRESTORE_NAMESPACE` to that exact historical value and rebuild. This is
+the Firestore path segment, not `VITE_FIREBASE_APP_ID`. Keep the original
+Firebase project configuration and sign in with the original Google account.
+Access rules must allow the signed-in user to read their budget subcollections.
+Failed reads show an error and block editing instead of showing an empty budget.
+Automatic discovery requires a connection to Firestore.
+
+Run the namespace regression tests with Node 24 or later:
+
+```sh
+node --test tests/budgetStorage.test.mjs
+npm run build
+```

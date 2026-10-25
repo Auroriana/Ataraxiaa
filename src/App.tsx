@@ -21,9 +21,10 @@ import {
 } from 'firebase/auth';
 import type { User } from 'firebase/auth';
 import { 
-  getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc
+  getFirestore, doc, setDoc, onSnapshot, collection, addDoc, deleteDoc, getDocsFromServer, query, limit
 } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
+import { BUDGET_COLLECTIONS, resolveBudgetNamespaces } from './budgetStorage';
 
 // --- TYPE DEFINITIONS ---
 type Frequency = 'daily' | 'monthly';
@@ -506,7 +507,10 @@ const firebaseReady = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId)
 const app = firebaseReady ? initializeApp(firebaseConfig) : null;
 const auth = app ? getAuth(app) : null;
 const db = app ? getFirestore(app) : null;
-const appId = 'ataraxia'; 
+const DEFAULT_SETTINGS: AppSettings = {
+  cutoffs: [13, 29], defaultWorkDays: [1, 2, 3, 4, 5], workOverrides: [],
+  healthThresholds: { safe: 50, caution: 20, danger: 20 },
+};
 const googleProvider = new GoogleAuthProvider();
 
 
@@ -515,12 +519,14 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
   const autoAnonRef = useRef(true);
+  const [storage, setStorage] = useState<{ uid: string; namespaces: string[]; selected: string } | null>(null);
+  const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  const [dataError, setDataError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+  const appId = storage?.uid === user?.uid ? storage?.selected ?? '' : '';
   const [activeTab, setActiveTab] = useState<Tab>('calendar');
   
-  const [settings, setSettings] = useState<AppSettings>({
-    cutoffs: [13, 29], defaultWorkDays: [1, 2, 3, 4, 5], workOverrides: [],
-    healthThresholds: { safe: 50, caution: 20, danger: 20 }
-  });
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [fixedExpenses, setFixedExpenses] = useState<FixedExpense[]>([]);
@@ -591,24 +597,92 @@ export default function App() {
   };
 
   useEffect(() => {
+    setStorage(null);
+    setDataError(null);
     if (!user || !db) return;
-    const basePath = `artifacts/${appId}/users/${user.uid}`;
-    
-    const unsubs = [
-      onSnapshot(doc(db, basePath, 'settings', 'config'), (snap) => {
-        if (snap.exists()) setSettings(prev => ({ ...prev, ...(snap.data() as Partial<AppSettings>) }));
-      }),
-      onSnapshot(collection(db, basePath, 'expenses'), (snap) => setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Expense))),
-      onSnapshot(collection(db, basePath, 'fixedExpenses'), (snap) => setFixedExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() }) as FixedExpense))),
-      onSnapshot(collection(db, basePath, 'incomeRules'), (snap) => setIncomeRules(snap.docs.map(d => ({ id: d.id, ...d.data() }) as IncomeRule))),
-      onSnapshot(collection(db, basePath, 'incomes'), (snap) => setIncomes(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Income))),
-      onSnapshot(collection(db, basePath, 'exceptions'), (snap) => setExceptions(snap.docs.map(d => ({ id: d.id, ...d.data() }) as ExceptionEntry))),
-      onSnapshot(collection(db, basePath, 'savingsGoals'), (snap) => setSavingsGoals(snap.docs.map(d => ({ id: d.id, ...d.data() }) as SavingsGoal))),
-      onSnapshot(collection(db, basePath, 'debts'), (snap) => setDebts(snap.docs.map(d => ({ id: d.id, ...d.data() }) as Debt)))
-    ];
+    let active = true;
+    const database = db;
+    // Server reads distinguish an empty budget from missing/offline cached data.
+    resolveBudgetNamespaces(async namespace => {
+      const snapshots = await Promise.all(BUDGET_COLLECTIONS.map(name =>
+        getDocsFromServer(query(collection(database, 'artifacts', namespace, 'users', user.uid, name), limit(1)))
+      ));
+      return snapshots.some(snapshot => !snapshot.empty);
+    }, import.meta.env.VITE_FIRESTORE_NAMESPACE).then(namespaces => {
+      if (active) setStorage({ uid: user.uid, namespaces, selected: namespaces[0] });
+    }).catch(error => {
+      console.error('Budget lookup failed:', error);
+      if (active) setDataError('Could not locate your saved budget. Check your connection and Firebase access, then retry. No data has been changed.');
+    });
+    return () => { active = false; };
+  }, [user?.uid, retry]);
 
-    return () => unsubs.forEach(u => u());
-  }, [user]);
+  useEffect(() => {
+    setLoadedPath(null);
+    setSettings(DEFAULT_SETTINGS);
+    setExpenses([]); setFixedExpenses([]); setIncomeRules([]); setIncomes([]);
+    setExceptions([]); setSavingsGoals([]); setDebts([]);
+    setIsModalOpen(false);
+    if (!user || !db || !appId) return;
+    const basePath = 'artifacts/' + appId + '/users/' + user.uid;
+    let active = true;
+    let failed = false;
+    const received = new Set<string>();
+    const ready = (name: string) => {
+      received.add(name);
+      if (active && !failed && received.size === BUDGET_COLLECTIONS.length) setLoadedPath(basePath);
+    };
+    const onError = (error: Error) => {
+      if (!active) return;
+      failed = true;
+      console.error('Budget subscription failed:', error);
+      setLoadedPath(null);
+      setDataError('Your saved budget could not be loaded. Check your connection and Firebase access, then retry.');
+    };
+    const unsubs = [
+      onSnapshot(doc(db, basePath, 'settings', 'config'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setSettings({ ...DEFAULT_SETTINGS, ...(snap.exists() ? snap.data() as Partial<AppSettings> : {}) });
+        if (!snap.metadata.fromCache) ready('settings');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'expenses'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setExpenses(snap.docs.map(d => ({ ...d.data(), id: d.id }) as Expense));
+        if (!snap.metadata.fromCache) ready('expenses');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'fixedExpenses'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setFixedExpenses(snap.docs.map(d => ({ ...d.data(), id: d.id }) as FixedExpense));
+        if (!snap.metadata.fromCache) ready('fixedExpenses');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'incomeRules'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setIncomeRules(snap.docs.map(d => ({ ...d.data(), id: d.id }) as IncomeRule));
+        if (!snap.metadata.fromCache) ready('incomeRules');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'incomes'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setIncomes(snap.docs.map(d => ({ ...d.data(), id: d.id }) as Income));
+        if (!snap.metadata.fromCache) ready('incomes');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'exceptions'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setExceptions(snap.docs.map(d => ({ ...d.data(), id: d.id }) as ExceptionEntry));
+        if (!snap.metadata.fromCache) ready('exceptions');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'savingsGoals'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setSavingsGoals(snap.docs.map(d => ({ ...d.data(), id: d.id }) as SavingsGoal));
+        if (!snap.metadata.fromCache) ready('savingsGoals');
+      }, onError),
+      onSnapshot(collection(db, basePath, 'debts'), { includeMetadataChanges: true }, snap => {
+        if (!active) return;
+        setDebts(snap.docs.map(d => ({ ...d.data(), id: d.id }) as Debt));
+        if (!snap.metadata.fromCache) ready('debts');
+      }, onError),
+    ];
+    return () => { active = false; unsubs.forEach(unsubscribe => unsubscribe()); };
+  }, [user?.uid, appId, retry]);
 
   const todayCycle = useMemo(() => getActivePeriod(new Date(), settings.cutoffs), [settings.cutoffs]);
   const viewedCycle = useMemo(() => getActivePeriod(viewedCycleAnchor, settings.cutoffs), [viewedCycleAnchor, settings.cutoffs]);
@@ -687,6 +761,18 @@ export default function App() {
     );
   }
 
+  if (dataError || !appId || loadedPath !== 'artifacts/' + appId + '/users/' + user.uid) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-center p-6 gap-4">
+        <p role={dataError ? 'alert' : 'status'}>{dataError ?? 'Loading your saved budget...'}</p>
+        <p className="text-sm text-gray-500">{user.email ?? 'Guest account'}</p>
+        {dataError && <button onClick={() => setRetry(value => value + 1)} className="px-4 py-2 rounded-lg bg-emerald-600 text-white">Retry</button>}
+        <AuthControl user={user} onSignIn={handleGoogleSignIn} onSignOut={handleSignOut} />
+        {authError && <p role="alert">{authError}</p>}
+      </div>
+    );
+  }
+
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: THEME_STYLES }} />
@@ -724,6 +810,19 @@ export default function App() {
               <span>{authError}</span>
               <button onClick={() => setAuthError(null)} className="text-red-400 hover:text-red-600 shrink-0"><X className="w-4 h-4"/></button>
             </div>
+          </div>
+        )}
+
+        {storage && storage.namespaces.length > 1 && (
+          <div className="max-w-5xl mx-auto px-4 pt-3">
+            <label className="text-sm">Saved budgets were found in two locations. Choose which to open:
+              <select aria-label="Saved budget" className="ml-2 border rounded p-2" value={appId}
+                onChange={event => setStorage({ ...storage, selected: event.target.value })}>
+                {storage.namespaces.map(namespace => <option key={namespace} value={namespace}>
+                  {namespace === 'default-app-id' ? 'Original budget' : 'Newer budget'}
+                </option>)}
+              </select>
+            </label>
           </div>
         )}
 
