@@ -53,6 +53,7 @@ interface LedgerEntry {
   source: 'manual' | 'scheduled';
   received: boolean;
   linkedType: LinkedType;
+  linkedTo?: string | null;
 }
 
 interface CycleRow {
@@ -95,8 +96,22 @@ interface SavingsDebtViewProps {
   user: User | null; db: Firestore | null; appId: string; savingsGoals: SavingsGoal[]; debts: Debt[]; expenses: Expense[];
   cycles: CycleRow[]; projection: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number;
 }
-interface PurchasePlannerProps { cycles: CycleRow[]; goals: GoalWithProgress[]; todayStartStr: string; }
-interface PlanRow { label: string; startStr: string; fullLabel: string; income: number; spent: number; extra: number; balance: number; ready: boolean; }
+interface PurchasePlannerProps { cycles: CycleRow[]; goals: GoalWithProgress[]; todayStartStr: string; user: User | null; db: Firestore | null; appId: string; }
+interface PlanPrefs { source: string; customPrice: string; alreadySaved: string; buffer: string; extra: number; cashOnHand: string; buyBy: string; overrides: Record<string, string>; }
+interface PlanBase {
+  idx: number; startStr: string; endStr: string; carryIn: number;
+  incomeItems: LedgerEntry[]; fixedItems: LedgerEntry[]; loggedItems: LedgerEntry[]; goalItems: LedgerEntry[];
+  income: number; pendingIncome: number; fixed: number; logged: number; extra: number; goalLogged: number; net: number;
+}
+interface PlanCycle extends PlanBase {
+  opening: number; available: number; autoAmount: number; defaultAmount: number; setAside: number;
+  overridden: boolean; overrideText: string; closingCash: number; fundBefore: number; fundAfter: number; reached: boolean; ready: boolean;
+}
+interface PlanCycleCardProps {
+  p: PlanCycle; price: number; cushion: number; isBuy: boolean; isReady: boolean; showDetails: boolean;
+  goal: GoalWithProgress | undefined; canLog: boolean; logging: boolean;
+  onSet: (value: string) => void; onReset: () => void; onLog: () => void;
+}
 interface SplitPlannerProps { goals: GoalWithProgress[]; cycles: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number; }
 interface DayDetailsModalProps {
   isOpen: boolean; onClose: () => void; dateStr: string | null; expenses: Expense[]; fixedExpenses: FixedExpense[];
@@ -374,7 +389,7 @@ const buildCycleEntries = (startStr: string, endStr: string, sc: ScheduleContext
   });
   src.expenses.forEach(e => {
     if (e.date < startStr || e.date > endStr) return;
-    entries.push({ date: e.date, kind: 'expense', amount: num(e.amount), category: e.category || 'Other', label: e.description || e.name || 'Expense', source: 'manual', received: true, linkedType: e.linkedType ?? null });
+    entries.push({ date: e.date, kind: 'expense', amount: num(e.amount), category: e.category || 'Other', label: e.description || e.name || 'Expense', source: 'manual', received: true, linkedType: e.linkedType ?? null, linkedTo: e.linkedTo ?? null });
   });
 
   return entries;
@@ -1172,7 +1187,7 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
       </div>
 
       {subTab === 'purchase' ? (
-        <PurchasePlanner goals={goalsWithProgress} cycles={projection} todayStartStr={todayStartStr} />
+        <PurchasePlanner goals={goalsWithProgress} cycles={projection} todayStartStr={todayStartStr} user={user} db={db} appId={appId} />
       ) : subTab === 'split' ? (
         <SplitPlanner goals={goalsWithProgress} cycles={cycles} cutoffs={cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth} />
       ) : (
@@ -1445,86 +1460,337 @@ function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }:
   );
 }
 
-function PurchasePlanner({ goals, cycles, todayStartStr }: PurchasePlannerProps) {
-  const [source, setSource] = useState<string>('custom');
-  const [customPrice, setCustomPrice] = useState('57990');
-  const [buffer, setBuffer] = useState('5000');
-  const [extra, setExtra] = useState(0);
-  const [cashOnHand, setCashOnHand] = useState('0');
+const PLAN_KEY = 'atx-purchase-plan-v1';
+const DEFAULT_PLAN_PREFS: PlanPrefs = { source: 'custom', customPrice: '57990', alreadySaved: '0', buffer: '5000', extra: 0, cashOnHand: '0', buyBy: 'auto', overrides: {} };
+const loadPlanPrefs = (): PlanPrefs => {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(PLAN_KEY) : null;
+    return raw ? { ...DEFAULT_PLAN_PREFS, ...JSON.parse(raw) } : DEFAULT_PLAN_PREFS;
+  } catch { return DEFAULT_PLAN_PREFS; }
+};
+const sumAmt = (list: LedgerEntry[]) => round2(list.reduce((t, e) => t + e.amount, 0));
+const byEntryDate = (a: LedgerEntry, b: LedgerEntry) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+const dayLabel = (s: string) => parseYMD(s).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 
-  const goal = goals.find(g => g.id === source);
-  const price = goal ? Math.max(0, num(goal.targetAmount) - goal.saved) : Math.max(0, num(customPrice));
-  const cushion = Math.max(0, num(buffer));
-  const target = price + cushion;
-  const startCash = num(cashOnHand);
+function ItemList({ title, items, tone, showStatus = false, empty }: { title: string; items: LedgerEntry[]; tone: string; showStatus?: boolean; empty: string }) {
+  return (
+    <div className="rounded-lg border border-gray-100 overflow-hidden">
+      <div className="flex justify-between items-center px-3 py-1.5 bg-gray-50 border-b border-gray-100">
+        <span className="text-[11px] font-bold text-gray-600">{title}</span>
+        <span className={`text-[11px] font-bold ${tone}`}>{formatPHP(sumAmt(items))}</span>
+      </div>
+      {items.length === 0 ? (
+        <p className="px-3 py-2 text-[11px] text-gray-400 italic">{empty}</p>
+      ) : (
+        <table className="w-full text-xs">
+          <tbody>
+            {items.map((e, i) => (
+              <tr key={`${e.date}-${e.label}-${i}`} className="border-t border-gray-50 first:border-t-0">
+                <td className="pl-3 pr-2 py-1.5 text-gray-400 whitespace-nowrap align-top">{dayLabel(e.date)}</td>
+                <td className="px-2 py-1.5 text-gray-700 align-top">
+                  {e.label}
+                  <span className="block text-[10px] text-gray-400">
+                    {e.category}{showStatus ? (e.received ? ' · received' : ' · expected') : ''}
+                  </span>
+                </td>
+                <td className={`pl-2 pr-3 py-1.5 text-right font-semibold whitespace-nowrap align-top ${tone}`}>{formatPHP(e.amount)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
 
-  const rows = useMemo<PlanRow[]>(() => {
+function FlowLine({ label, value, sign, strong = false, tone = 'text-gray-700' }: { label: string; value: number; sign?: '+' | '−' | '='; strong?: boolean; tone?: string }) {
+  return (
+    <div className={`flex justify-between items-baseline py-1 text-xs ${strong ? 'border-t border-gray-200 mt-1 pt-2 font-bold' : ''}`}>
+      <span className="text-gray-500">{sign ? <span className="inline-block w-4 text-gray-400">{sign}</span> : null}{label}</span>
+      <span className={`font-semibold ${tone}`}>{formatPHP(value)}</span>
+    </div>
+  );
+}
+
+function PlanCycleCard({ p, price, cushion, isBuy, isReady, showDetails, goal, canLog, logging, onSet, onReset, onLog }: PlanCycleCardProps) {
+  const short = p.closingCash < 0;
+  const low = !short && p.closingCash < cushion;
+  const pct = price > 0 ? Math.min(100, (p.fundAfter / price) * 100) : 0;
+  const toLog = round2(p.setAside - p.goalLogged);
+  const cashTone = short ? 'text-red-600' : low ? 'text-amber-600' : 'text-emerald-700';
+
+  return (
+    <div className={`atx-card rounded-xl shadow-sm overflow-hidden ${isReady ? 'ring-2 ring-emerald-300' : ''}`}>
+      <div className="px-5 py-3 border-b border-[var(--atx-border)] bg-gray-50 flex flex-wrap items-center gap-2">
+        <h3 className="font-bold text-gray-900 text-sm">{p.idx === 0 ? 'This cut-off' : `Cut-off ${p.idx + 1}`} · {shortDate(p.startStr)} – {shortDate(p.endStr)}</h3>
+        {isReady && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Ready to buy</span>}
+        {isBuy && !isReady && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">Target cut-off</span>}
+        {short && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-700 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> Cash goes negative</span>}
+        <span className="ml-auto text-[11px] text-gray-400">Starts {dayLabel(p.startStr)}</span>
+      </div>
+
+      <div className="p-5 space-y-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="rounded-lg bg-blue-50 p-3"><p className="text-[10px] text-blue-600 font-semibold">Income</p><p className="text-sm font-bold text-blue-800">{formatPHP(p.income)}</p></div>
+          <div className="rounded-lg bg-slate-100 p-3"><p className="text-[10px] text-slate-600 font-semibold">Fixed spending</p><p className="text-sm font-bold text-slate-800">{formatPHP(p.fixed)}</p></div>
+          <div className="rounded-lg bg-amber-50 p-3"><p className="text-[10px] text-amber-700 font-semibold">Logged + extra</p><p className="text-sm font-bold text-amber-800">{formatPHP(round2(p.logged + p.extra))}</p></div>
+          <div className="rounded-lg bg-emerald-50 p-3"><p className="text-[10px] text-emerald-700 font-semibold">Left this cut-off</p><p className={`text-sm font-bold ${p.net < 0 ? 'text-red-600' : 'text-emerald-800'}`}>{formatPHP(p.net)}</p></div>
+        </div>
+
+        {showDetails && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <ItemList title="Income" items={p.incomeItems} tone="text-blue-700" showStatus empty="No income dated in this cut-off." />
+            <ItemList title="Fixed spending" items={p.fixedItems} tone="text-slate-700" empty="No fixed expenses in this cut-off." />
+            <ItemList title="Logged spending" items={p.loggedItems} tone="text-amber-700" empty="Nothing logged by hand." />
+            <div className="space-y-3">
+              {goal && <ItemList title={`Already put toward ${goal.name}`} items={p.goalItems} tone="text-emerald-700" empty="No contribution logged yet." />}
+              <div className="rounded-lg border border-gray-100 px-3 py-2 flex justify-between text-xs">
+                <span className="text-gray-600 font-bold text-[11px]">Extra spending (slider)</span>
+                <span className="font-bold text-rose-600 text-[11px]">{formatPHP(p.extra)}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="rounded-lg border border-gray-100 p-3">
+            <FlowLine label="Cash carried in" value={p.opening} />
+            <FlowLine label="Income" value={p.income} sign="+" tone="text-blue-700" />
+            <FlowLine label="Fixed spending" value={p.fixed} sign="−" />
+            <FlowLine label="Logged spending" value={p.logged} sign="−" />
+            <FlowLine label="Extra spending" value={p.extra} sign="−" />
+            <FlowLine label="Available to set aside" value={p.available} sign="=" strong tone={p.available < 0 ? 'text-red-600' : 'text-gray-900'} />
+            <FlowLine label="Set aside for the purchase" value={p.setAside} sign="−" tone="text-emerald-700" />
+            <FlowLine label="Cash left after saving" value={p.closingCash} sign="=" strong tone={cashTone} />
+            {low && <p className="text-[10px] text-amber-600 mt-1">Below your {formatPHP(cushion)} cushion.</p>}
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-bold text-gray-600 mb-1">Set aside this cut-off</label>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-gray-400">₱</span>
+                <input type="number" min={p.goalLogged} step="100" value={p.overridden ? p.overrideText : String(p.defaultAmount)} onChange={e => onSet(e.target.value)}
+                  className="flex-1 p-2 border border-gray-300 rounded text-sm font-bold outline-none focus:border-emerald-400" />
+                {p.overridden && <button onClick={onReset} className="text-[11px] font-bold px-2 py-2 rounded border border-gray-200 hover:bg-gray-50 text-gray-500">Reset</button>}
+              </div>
+              <p className="text-[11px] text-gray-400 mt-1">Even split suggests {formatPHP(p.autoAmount)}{p.goalLogged > 0 ? ` · already logged ${formatPHP(p.goalLogged)}` : ''}.</p>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-[11px] font-bold mb-1">
+                <span className="text-gray-500">Saved {formatPHP(p.fundBefore)} → {formatPHP(p.fundAfter)}</span>
+                <span className="text-gray-400">{pct.toFixed(0)}% of {compactPHP(price)}</span>
+              </div>
+              <div className="w-full bg-gray-100 rounded-full h-2">
+                <div className="bg-emerald-400 h-2 rounded-full transition-all" style={{ width: `${pct}%` }}></div>
+              </div>
+            </div>
+
+            {goal ? (
+              toLog > 0 ? (
+                <button onClick={onLog} disabled={!canLog || logging} className="w-full text-xs font-bold py-2 rounded-lg bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-50 transition-colors">
+                  {logging ? 'Logging…' : `Log ${formatPHP(toLog)} to ${goal.name}`}
+                </button>
+              ) : (
+                <p className="text-[11px] text-emerald-700 font-semibold">{p.goalLogged > 0 ? `${formatPHP(p.goalLogged)} is logged for this cut-off.` : 'Nothing to log.'}</p>
+              )
+            ) : (
+              <p className="text-[11px] text-gray-400">Create a savings goal on the left to log contributions from here.</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PurchasePlanner({ goals, cycles, todayStartStr, user, db, appId }: PurchasePlannerProps) {
+  const [prefs, setPrefs] = useState<PlanPrefs>(loadPlanPrefs);
+  const [showDetails, setShowDetails] = useState(true);
+  const [showAll, setShowAll] = useState(false);
+  const [logging, setLogging] = useState<string | null>(null);
+  const [newGoalName, setNewGoalName] = useState('New purchase');
+
+  const patch = (next: Partial<PlanPrefs>) => setPrefs(prev => ({ ...prev, ...next }));
+  useEffect(() => {
+    try { localStorage.setItem(PLAN_KEY, JSON.stringify(prefs)); } catch { /* storage unavailable */ }
+  }, [prefs]);
+
+  const goal = goals.find(g => g.id === prefs.source);
+  const price = goal ? Math.max(0, num(goal.targetAmount) - goal.saved) : Math.max(0, num(prefs.customPrice));
+  const fullPrice = goal ? Math.max(0, num(goal.targetAmount)) : price;
+  const cushion = Math.max(0, num(prefs.buffer));
+  const startCash = num(prefs.cashOnHand);
+  const extra = prefs.extra;
+
+  const base = useMemo<PlanBase[]>(() => {
     const curIdx = cycles.findIndex(c => c.startStr === todayStartStr);
     if (curIdx < 0) return [];
     const todayStr = toYYYYMMDD(new Date());
     const dailyExtra = (extra * 12) / 365;
-    let running = 0;
-    let extraSoFar = 0;
-    const out: PlanRow[] = [];
-    for (let i = curIdx; i < cycles.length; i++) {
-      const c = cycles[i];
-      running = i === curIdx ? round2(startCash + c.closingProjected) : round2(running + c.expectedIncome - c.totalExpenses);
+    return cycles.slice(curIdx).map((c, k) => {
+      const incomeItems = c.entries.filter(e => e.kind === 'income').sort(byEntryDate);
+      const expenseItems = c.entries.filter(e => e.kind === 'expense');
+      const goalItems = goal ? expenseItems.filter(e => e.linkedType === 'goal' && e.linkedTo === goal.id).sort(byEntryDate) : [];
+      const rest = expenseItems.filter(e => !goalItems.includes(e));
+      const fixedItems = rest.filter(e => e.source === 'scheduled').sort(byEntryDate);
+      const loggedItems = rest.filter(e => e.source === 'manual').sort(byEntryDate);
       const from = c.startStr > todayStr ? c.startStr : todayStr;
-      const extraThisCycle = round2(dailyExtra * Math.max(0, daysBetween(from, c.endStr) + 1));
-      extraSoFar = round2(extraSoFar + extraThisCycle);
-      const balance = round2(running - extraSoFar);
-      out.push({
-        label: i === curIdx ? 'Now' : shortDate(c.startStr),
-        startStr: c.startStr,
-        fullLabel: `${shortDate(c.startStr)} – ${shortDate(c.endStr)}`,
-        income: c.expectedIncome,
-        spent: round2(c.totalExpenses + extraThisCycle),
-        extra: extraThisCycle,
-        balance,
-        ready: balance >= target
-      });
-    }
-    return out;
-  }, [cycles, todayStartStr, extra, startCash, target]);
+      const extraAmt = round2(dailyExtra * Math.max(0, daysBetween(from, c.endStr) + 1));
+      const income = sumAmt(incomeItems);
+      const fixed = sumAmt(fixedItems);
+      const logged = sumAmt(loggedItems);
+      return {
+        idx: k, startStr: c.startStr, endStr: c.endStr, carryIn: c.carryIn,
+        incomeItems, fixedItems, loggedItems, goalItems,
+        income, pendingIncome: sumAmt(incomeItems.filter(e => !e.received)), fixed, logged, extra: extraAmt, goalLogged: sumAmt(goalItems),
+        net: round2(income - fixed - logged - extraAmt)
+      };
+    });
+  }, [cycles, todayStartStr, extra, goal]);
 
-  const hasIncome = rows.some(r => r.income > 0);
-  const firstReady = rows.findIndex(r => r.ready);
-  const readyRow = firstReady >= 0 ? rows[firstReady] : null;
-  const bestBalance = rows.reduce((m, r) => Math.max(m, r.balance), -Infinity);
+  const startFund = goal
+    ? Math.max(0, round2(goal.saved - base.reduce((t, b) => t + b.goalLogged, 0)))
+    : Math.max(0, num(prefs.alreadySaved));
+
+  const maxPlan = useMemo(() => {
+    let cash = 0;
+    let fund = startFund;
+    let idx: number | null = null;
+    const puts: number[] = [];
+    for (let i = 0; i < base.length; i++) {
+      const b = base[i];
+      const opening = i === 0 ? round2(b.carryIn + startCash) : cash;
+      const available = round2(opening + b.net);
+      const remaining = Math.max(0, round2(price - fund));
+      const put = Math.max(b.goalLogged, idx !== null ? 0 : Math.min(remaining, Math.max(0, available - cushion)));
+      fund = round2(fund + put);
+      cash = round2(available - put);
+      if (idx === null && fund >= price && cash >= cushion) idx = i;
+      puts.push(round2(put));
+    }
+    return { idx, puts };
+  }, [base, startFund, startCash, price, cushion]);
+
+  const chosenIdx = base.findIndex(b => b.startStr === prefs.buyBy);
+  const buyIdx = chosenIdx >= 0 ? chosenIdx : (maxPlan.idx ?? Math.max(0, base.length - 1));
+
+  const plan = useMemo<PlanCycle[]>(() => {
+    let cash = 0;
+    let fund = startFund;
+    return base.map((b, i) => {
+      const opening = i === 0 ? round2(b.carryIn + startCash) : cash;
+      const available = round2(opening + b.net);
+      const remaining = Math.max(0, round2(price - fund));
+      const autoAmount = i > buyIdx ? 0 : Math.min(remaining, Math.ceil(remaining / Math.max(1, buyIdx - i + 1)));
+      const defaultAmount = Math.max(autoAmount, b.goalLogged);
+      const ov = prefs.overrides[b.startStr];
+      const overridden = ov !== undefined && ov !== '';
+      const setAside = Math.max(overridden ? Math.max(0, num(ov)) : defaultAmount, b.goalLogged);
+      const closingCash = round2(available - setAside);
+      const fundBefore = fund;
+      fund = round2(fund + setAside);
+      cash = closingCash;
+      return {
+        ...b, opening, available, autoAmount, defaultAmount, setAside, overridden, overrideText: overridden ? ov : '',
+        closingCash, fundBefore, fundAfter: fund, reached: fund >= price, ready: fund >= price && closingCash >= cushion
+      };
+    });
+  }, [base, startFund, startCash, price, cushion, buyIdx, prefs.overrides]);
+
+  const readyIdx = plan.findIndex(p => p.ready);
+  const readyRow = readyIdx >= 0 ? plan[readyIdx] : null;
+  const hasIncome = plan.some(p => p.income > 0);
+  const visibleCount = showAll ? plan.length : Math.min(plan.length, Math.max(4, Math.max(buyIdx, readyIdx) + 2));
+  const visible = plan.slice(0, visibleCount);
+  const negatives = visible.filter(p => p.closingCash < 0);
+  const lastRow = visible.length > 0 ? visible[visible.length - 1] : null;
+  const labelOf = (p: PlanCycle) => (p.idx === 0 ? 'Now' : shortDate(p.startStr));
+
+  const fundData = visible.map(p => ({ label: labelOf(p), fund: p.fundAfter, cash: p.closingCash }));
+  const flowData = visible.map(p => ({ label: labelOf(p), Fixed: p.fixed, Logged: p.logged, Extra: p.extra, Saved: p.setAside, Income: p.income }));
+
+  const totals = visible.reduce((t, p) => ({
+    income: t.income + p.income, fixed: t.fixed + p.fixed, logged: t.logged + p.logged, extra: t.extra + p.extra, saved: t.saved + p.setAside
+  }), { income: 0, fixed: 0, logged: 0, extra: 0, saved: 0 });
+
+  const logContribution = async (p: PlanCycle) => {
+    const amt = round2(p.setAside - p.goalLogged);
+    if (!goal || !user || !db || amt <= 0) return;
+    setLogging(p.startStr);
+    try {
+      const todayStr = toYYYYMMDD(new Date());
+      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'expenses'), {
+        date: p.startStr > todayStr ? p.startStr : todayStr, amount: amt, description: `Contribution: ${goal.name}`,
+        category: 'Other', linkedType: 'goal', linkedTo: goal.id, createdAt: new Date().toISOString()
+      });
+    } catch (err) { console.error(err); } finally { setLogging(null); }
+  };
+
+  const createGoal = async () => {
+    const name = newGoalName.trim();
+    if (!user || !db || !name || price <= 0) return;
+    try {
+      const ref = await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'savingsGoals'), { name, targetAmount: price, createdAt: new Date().toISOString() });
+      patch({ source: ref.id });
+    } catch (err) { console.error(err); }
+  };
 
   let verdict: { tone: InsightTone; text: string } | null = null;
-  if (price > 0 && rows.length > 0) {
-    if (!hasIncome) verdict = { tone: 'info', text: 'No expected income found yet. Add your salary under Settings (income rules) and any one-off pay such as a 13th month or incentive on the calendar, so the projection has something to work with.' };
-    else if (!readyRow) verdict = { tone: 'bad', text: `At ${formatPHP(extra)} of extra spending a month, your balance tops out around ${formatPHP(bestBalance)} in the next ${plural(rows.length, 'cycle', 'cycles')}, short of the ${formatPHP(target)} you need. Lower the extra spending or the cushion.` };
-    else if (firstReady === 0) verdict = { tone: 'good', text: `You already cover the ${formatPHP(price)} plus a ${formatPHP(cushion)} cushion by the end of this cycle.` };
-    else verdict = { tone: 'good', text: `Earliest cycle that covers ${formatPHP(price)} plus a ${formatPHP(cushion)} cushion: ${readyRow.fullLabel}. You'd have ${formatPHP(readyRow.balance)} then, leaving ${formatPHP(readyRow.balance - price)} after the purchase.` };
+  if (price > 0 && plan.length > 0) {
+    if (!hasIncome) verdict = { tone: 'info', text: 'No expected income found. Add your salary under Settings (income rules) and one-off pay such as a 13th month or incentive on the calendar, so the plan has something to work with.' };
+    else if (readyRow) verdict = { tone: 'good', text: `Ready in the ${`${shortDate(readyRow.startStr)} – ${shortDate(readyRow.endStr)}`} cut-off: ${formatPHP(price)} saved with ${formatPHP(readyRow.closingCash)} cash still on hand (cushion ${formatPHP(cushion)}).` };
+    else if (maxPlan.idx === null) verdict = { tone: 'bad', text: `Even saving everything above your ${formatPHP(cushion)} cushion, you don't reach ${formatPHP(price)} within ${plural(plan.length, 'cut-off', 'cut-offs')}. Lower the extra spending, the cushion, or the price.` };
+    else verdict = { tone: 'warn', text: `This plan has ${formatPHP(Math.max(0, price - (lastRow ? lastRow.fundAfter : 0)))} still to save by the last cut-off shown. Raise what you set aside, or pick a later buy cut-off. The earliest possible is ${shortDate(plan[maxPlan.idx].startStr)}.` };
   }
-
-  const chartData = rows.map(r => ({ label: r.label, income: r.income, balance: r.balance }));
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 animate-in slide-in-from-bottom-4 duration-300">
-      <div className="lg:col-span-2 atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400 space-y-5 self-start">
+      <div className="lg:col-span-2 atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400 space-y-5 self-start lg:sticky lg:top-4">
         <div>
-          <h2 className="text-lg font-bold text-emerald-800 flex items-center gap-2"><Wallet className="w-5 h-5"/> Can I buy it?</h2>
-          <p className="text-xs text-gray-500 mt-1">Uses your fixed expenses, income rules and logged entries to project your balance cycle by cycle.</p>
+          <h2 className="text-lg font-bold text-emerald-800 flex items-center gap-2"><Wallet className="w-5 h-5"/> Purchase plan</h2>
+          <p className="text-xs text-gray-500 mt-1">Built from your fixed expenses, income rules and logged entries, cut-off by cut-off. Your edits are saved on this device.</p>
         </div>
 
         <div>
           <label className="block text-xs font-bold text-gray-600 mb-1">What are you buying?</label>
-          <select value={source} onChange={e => setSource(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm bg-white outline-none">
+          <select value={goal ? goal.id : 'custom'} onChange={e => patch({ source: e.target.value, overrides: {} })} className="w-full p-2 border border-gray-300 rounded text-sm bg-white outline-none">
             <option value="custom">Something new (enter a price)</option>
             {goals.length > 0 && <optgroup label="Your savings goals">{goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</optgroup>}
           </select>
           {goal ? (
-            <p className="text-[11px] text-gray-500 mt-2">Left to fund on this goal: <span className="font-bold text-gray-700">{formatPHP(price)}</span></p>
+            <div className="bg-emerald-50 border border-emerald-100 rounded-lg p-3 text-xs space-y-1 mt-2">
+              <div className="flex justify-between"><span className="text-gray-500">Target</span><span className="font-bold">{formatPHP(fullPrice)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">Already saved</span><span className="font-bold text-emerald-700">{formatPHP(goal.saved)}</span></div>
+              <div className="flex justify-between border-t border-emerald-100 pt-1"><span className="text-gray-600 font-semibold">Left to save</span><span className="font-bold">{formatPHP(price)}</span></div>
+            </div>
           ) : (
-            <div className="flex gap-2 mt-2">
-              <input type="number" min="0" step="0.01" value={customPrice} onChange={e => setCustomPrice(e.target.value)} className="flex-1 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" placeholder="Price ₱" />
-              <button onClick={() => setCustomPrice('55000')} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">55k</button>
-              <button onClick={() => setCustomPrice('57990')} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">57,990</button>
+            <div className="space-y-2 mt-2">
+              <div className="flex gap-2">
+                <input type="number" min="0" step="0.01" value={prefs.customPrice} onChange={e => patch({ customPrice: e.target.value })} className="flex-1 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" placeholder="Price ₱" />
+                <button onClick={() => patch({ customPrice: '55000' })} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">55k</button>
+                <button onClick={() => patch({ customPrice: '57990' })} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">57,990</button>
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-gray-500 mb-1">Already saved for this ₱</label>
+                <input type="number" min="0" step="500" value={prefs.alreadySaved} onChange={e => patch({ alreadySaved: e.target.value })} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+              </div>
+              <div className="flex gap-2 bg-emerald-50 border border-emerald-100 rounded-lg p-2">
+                <input type="text" value={newGoalName} onChange={e => setNewGoalName(e.target.value)} className="flex-1 min-w-0 p-1.5 border border-gray-200 rounded text-xs outline-none" aria-label="Goal name" />
+                <button onClick={createGoal} disabled={!user || !db || price <= 0} className="text-[11px] font-bold px-2 rounded bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-50">Make a goal</button>
+              </div>
+              <p className="text-[10px] text-gray-400">A goal lets you log each contribution from the plan.</p>
             </div>
           )}
+        </div>
+
+        <div>
+          <label className="block text-xs font-bold text-gray-600 mb-1">Buy it in</label>
+          <select value={chosenIdx >= 0 ? prefs.buyBy : 'auto'} onChange={e => patch({ buyBy: e.target.value, overrides: {} })} className="w-full p-2 border border-gray-300 rounded text-sm bg-white outline-none">
+            <option value="auto">{maxPlan.idx !== null ? `Earliest possible (${shortDate(base[maxPlan.idx].startStr)} cut-off)` : 'Earliest possible'}</option>
+            {base.map(b => <option key={b.startStr} value={b.startStr}>{shortDate(b.startStr)} – {shortDate(b.endStr)}</option>)}
+          </select>
         </div>
 
         <div>
@@ -1532,34 +1798,41 @@ function PurchasePlanner({ goals, cycles, todayStartStr }: PurchasePlannerProps)
             <label htmlFor="extra-spend" className="block text-xs font-bold text-gray-600">Extra spending per month</label>
             <span className="text-sm font-bold text-emerald-700">{formatPHP(extra)}</span>
           </div>
-          <input id="extra-spend" type="range" min="0" max="20000" step="500" value={extra} onChange={e => setExtra(Number(e.target.value))} className="w-full accent-emerald-500" />
-          <p className="text-[11px] text-gray-400 mt-1">Shopping and anything not already in your fixed expenses or logged entries.</p>
+          <input id="extra-spend" type="range" min="0" max="20000" step="500" value={extra} onChange={e => patch({ extra: Number(e.target.value) })} className="w-full accent-emerald-500" />
+          <p className="text-[11px] text-gray-400 mt-1">Shopping and anything not in your fixed expenses or logged entries.</p>
         </div>
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-xs font-bold text-gray-600 mb-1">Emergency cushion ₱</label>
-            <input type="number" min="0" step="500" value={buffer} onChange={e => setBuffer(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+            <label className="block text-xs font-bold text-gray-600 mb-1">Cash cushion ₱</label>
+            <input type="number" min="0" step="500" value={prefs.buffer} onChange={e => patch({ buffer: e.target.value })} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
           </div>
           <div>
-            <label className="block text-xs font-bold text-gray-600 mb-1">Cash not in the app ₱</label>
-            <input type="number" min="0" step="500" value={cashOnHand} onChange={e => setCashOnHand(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+            <label className="block text-xs font-bold text-gray-600 mb-1">Cash not in app ₱</label>
+            <input type="number" min="0" step="500" value={prefs.cashOnHand} onChange={e => patch({ cashOnHand: e.target.value })} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
           </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button onClick={() => patch({ overrides: Object.fromEntries(base.map((b, i) => [b.startStr, String(maxPlan.puts[i])])) })} disabled={price <= 0 || base.length === 0}
+            className="text-[11px] font-bold py-2 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 disabled:opacity-40">Save the most each cut-off</button>
+          <button onClick={() => patch({ overrides: {} })} className="text-[11px] font-bold py-2 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50">Reset my edits</button>
         </div>
       </div>
 
-      <div className="lg:col-span-3 space-y-6">
-        {price <= 0 || rows.length === 0 ? (
+      <div className="lg:col-span-3 space-y-6 min-w-0">
+        {price <= 0 || plan.length === 0 ? (
           <div className="atx-card p-10 rounded-xl shadow-sm text-center text-gray-400">
             <Wallet className="w-10 h-10 mx-auto mb-2 opacity-20" />
-            <p className="text-sm italic">{goal && price <= 0 ? `${goal.name} is already fully funded.` : 'Enter a price to see when your projected balance can cover it.'}</p>
+            <p className="text-sm italic">{goal && price <= 0 ? `${goal.name} is already fully funded.` : 'Enter a price to see your cut-off by cut-off plan.'}</p>
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <ReportStat title="Needed (price + cushion)" value={formatPHP(target)} sub={`${formatPHP(price)} + ${formatPHP(cushion)}`} />
-              <ReportStat title="Earliest cycle" value={readyRow ? (firstReady === 0 ? 'This cycle' : shortDate(readyRow.startStr)) : 'Not yet'} sub={readyRow ? readyRow.fullLabel : `Within ${plural(rows.length, 'cycle', 'cycles')}`} valueClass={readyRow ? 'text-emerald-700' : 'text-red-600'} />
-              <ReportStat title="Left after buying" value={readyRow ? formatPHP(readyRow.balance - price) : '—'} sub={readyRow ? `Balance then ${formatPHP(readyRow.balance)}` : undefined} />
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <ReportStat title="Left to save" value={formatPHP(Math.max(0, price - startFund))} sub={`Price ${formatPHP(price)}${startFund > 0 ? ` · ${formatPHP(startFund)} saved` : ''}`} />
+              <ReportStat title="Per cut-off (even split)" value={formatPHP(plan[0].autoAmount)} sub={`${plural(buyIdx + 1, 'cut-off', 'cut-offs')} to ${shortDate(plan[buyIdx].startStr)}`} />
+              <ReportStat title="Ready in" value={readyRow ? shortDate(readyRow.startStr) : 'Not yet'} sub={readyRow ? `${shortDate(readyRow.startStr)} – ${shortDate(readyRow.endStr)}` : 'With the current plan'} valueClass={readyRow ? 'text-emerald-700' : 'text-red-600'} />
+              <ReportStat title="Cash left after" value={readyRow ? formatPHP(readyRow.closingCash) : '—'} sub={readyRow ? `Cushion ${formatPHP(cushion)}` : undefined} />
             </div>
 
             {verdict && (
@@ -1568,20 +1841,44 @@ function PurchasePlanner({ goals, cycles, todayStartStr }: PurchasePlannerProps)
                 <p>{verdict.text}</p>
               </div>
             )}
+            {negatives.length > 0 && (
+              <div className="p-3 rounded-lg border text-xs flex items-start gap-2 bg-red-50 border-red-200 text-red-800">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <p>Your cash goes below zero after saving in: {negatives.map(n => `${shortDate(n.startStr)} (${formatPHP(n.closingCash)})`).join(', ')}. Lower what you set aside in those cut-offs.</p>
+              </div>
+            )}
 
-            <ChartCard title="Income and projected balance" subtitle="Bars are expected income per cycle. The line is your balance after spending and extra spending.">
-              <div className="h-72 w-full">
+            <ChartCard title="Savings vs price" subtitle="Green is what you'll have saved by the end of each cut-off. Blue is the cash left in your account after saving.">
+              <div className="h-64 w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                  <ComposedChart data={fundData} margin={{ top: 16, right: 12, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} interval={0} />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} domain={[0, (dataMax: number) => Math.ceil(Math.max(dataMax, price) * 1.08)]} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <Legend iconType="circle" wrapperStyle={{ fontSize: 12 }} />
+                    <ReferenceLine y={price} stroke="#f59e0b" strokeDasharray="5 4" label={{ value: `Price ${formatPHP(price)}`, position: 'insideTopLeft', fontSize: 11, fill: '#b45309' }} />
+                    <Area type="monotone" dataKey="fund" name="Saved for purchase" stroke="#10b981" strokeWidth={2.5} fill="#10b981" fillOpacity={0.15} dot={{ r: 3 }} />
+                    <Line type="monotone" dataKey="cash" name="Cash left" stroke="#3b82f6" strokeWidth={2} dot={{ r: 2 }} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+
+            <ChartCard title="Where each cut-off's income goes" subtitle="Stacked bars are fixed spending, logged spending, extra spending and what you set aside. The blue line is that cut-off's income.">
+              <div className="h-64 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={flowData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
                     <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
                     <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
-                    <Legend iconType="circle" />
-                    <ReferenceLine y={price} stroke="#f59e0b" strokeDasharray="5 4" label={{ value: 'Price', position: 'insideTopLeft', fontSize: 10, fill: '#b45309' }} />
-                    <ReferenceLine y={target} stroke="#8b5cf6" strokeDasharray="5 4" label={{ value: 'Price + cushion', position: 'insideTopLeft', fontSize: 10, fill: '#6d28d9' }} />
-                    <Bar dataKey="income" name="Income" fill="#93c5fd" radius={[4, 4, 0, 0]} maxBarSize={28} />
-                    <Line type="monotone" dataKey="balance" name="Balance" stroke="#10b981" strokeWidth={2.5} dot={{ r: 3 }} />
+                    <Legend iconType="circle" wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="Fixed" stackId="out" fill="#94a3b8" />
+                    <Bar dataKey="Logged" stackId="out" fill="#f59e0b" />
+                    <Bar dataKey="Extra" stackId="out" fill="#fb7185" />
+                    <Bar dataKey="Saved" stackId="out" fill="#10b981" radius={[4, 4, 0, 0]} />
+                    <Line type="monotone" dataKey="Income" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3 }} />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
@@ -1589,32 +1886,68 @@ function PurchasePlanner({ goals, cycles, todayStartStr }: PurchasePlannerProps)
 
             <div className="atx-card rounded-xl shadow-sm overflow-hidden">
               <div className="px-5 py-3 border-b border-[var(--atx-border)] bg-gray-50">
-                <h3 className="font-bold text-gray-800 text-sm">Cycle by cycle</h3>
-                <p className="text-[11px] text-gray-500 mt-0.5">Balance is the closing balance of each cycle, assuming all expected income arrives.</p>
+                <h3 className="font-bold text-gray-800 text-sm">At a glance</h3>
+                <p className="text-[11px] text-gray-500 mt-0.5">Every cut-off in one table. Edit the amounts in the cards below.</p>
               </div>
-              <div className="max-h-96 overflow-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-white sticky top-0 text-[11px] text-gray-400">
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs whitespace-nowrap">
+                  <thead className="bg-white text-[11px] text-gray-400">
                     <tr>
-                      <th className="text-left font-semibold px-5 py-2">Cycle</th>
+                      <th className="text-left font-semibold px-5 py-2">Cut-off</th>
                       <th className="text-right font-semibold px-2 py-2">Income</th>
-                      <th className="text-right font-semibold px-2 py-2">Spent</th>
-                      <th className="text-right font-semibold px-5 py-2">Balance</th>
+                      <th className="text-right font-semibold px-2 py-2">Fixed</th>
+                      <th className="text-right font-semibold px-2 py-2">Logged</th>
+                      <th className="text-right font-semibold px-2 py-2">Extra</th>
+                      <th className="text-right font-semibold px-2 py-2">Set aside</th>
+                      <th className="text-right font-semibold px-2 py-2">Saved</th>
+                      <th className="text-right font-semibold px-5 py-2">Cash left</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map((r, i) => (
-                      <tr key={r.fullLabel} className={`border-t border-gray-100 ${i === firstReady ? 'bg-emerald-50' : ''}`}>
-                        <td className="px-5 py-2 text-gray-600 whitespace-nowrap">{r.fullLabel}{i === 0 ? <span className="text-gray-400"> · now</span> : null}</td>
-                        <td className="px-2 py-2 text-right text-gray-700">{formatPHP(r.income)}</td>
-                        <td className="px-2 py-2 text-right text-gray-500">{formatPHP(r.spent)}</td>
-                        <td className={`px-5 py-2 text-right font-bold ${r.ready ? 'text-emerald-700' : 'text-gray-800'}`}>{formatPHP(r.balance)}</td>
+                    {visible.map(p => (
+                      <tr key={p.startStr} className={`border-t border-gray-100 ${p.ready && p.idx === readyIdx ? 'bg-emerald-50' : ''}`}>
+                        <td className="px-5 py-2 text-gray-600">{shortDate(p.startStr)} – {shortDate(p.endStr)}{p.idx === 0 ? <span className="text-gray-400"> · now</span> : null}</td>
+                        <td className="px-2 py-2 text-right text-blue-700">{formatPHP(p.income)}</td>
+                        <td className="px-2 py-2 text-right text-gray-600">{formatPHP(p.fixed)}</td>
+                        <td className="px-2 py-2 text-right text-gray-600">{formatPHP(p.logged)}</td>
+                        <td className="px-2 py-2 text-right text-gray-600">{formatPHP(p.extra)}</td>
+                        <td className="px-2 py-2 text-right font-bold text-emerald-700">{formatPHP(p.setAside)}</td>
+                        <td className="px-2 py-2 text-right text-gray-800">{formatPHP(p.fundAfter)}</td>
+                        <td className={`px-5 py-2 text-right font-bold ${p.closingCash < 0 ? 'text-red-600' : p.closingCash < cushion ? 'text-amber-600' : 'text-gray-800'}`}>{formatPHP(p.closingCash)}</td>
                       </tr>
                     ))}
+                    <tr className="border-t-2 border-gray-200 bg-gray-50 font-bold">
+                      <td className="px-5 py-2 text-gray-700">Total</td>
+                      <td className="px-2 py-2 text-right text-blue-700">{formatPHP(totals.income)}</td>
+                      <td className="px-2 py-2 text-right">{formatPHP(totals.fixed)}</td>
+                      <td className="px-2 py-2 text-right">{formatPHP(totals.logged)}</td>
+                      <td className="px-2 py-2 text-right">{formatPHP(totals.extra)}</td>
+                      <td className="px-2 py-2 text-right text-emerald-700">{formatPHP(totals.saved)}</td>
+                      <td className="px-2 py-2"></td>
+                      <td className="px-5 py-2"></td>
+                    </tr>
                   </tbody>
                 </table>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-bold text-gray-800 text-sm">Cut-off by cut-off breakdown</h3>
+              <div className="flex gap-2">
+                <button onClick={() => setShowDetails(v => !v)} className="text-[11px] font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50">{showDetails ? 'Hide item lists' : 'Show item lists'}</button>
+                {plan.length > visibleCount || showAll ? (
+                  <button onClick={() => setShowAll(v => !v)} className="text-[11px] font-bold px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50">{showAll ? 'Show fewer' : `Show all ${plan.length}`}</button>
+                ) : null}
+              </div>
+            </div>
+
+            {visible.map(p => (
+              <PlanCycleCard key={p.startStr} p={p} price={price} cushion={cushion} isBuy={p.idx === buyIdx} isReady={p.idx === readyIdx} showDetails={showDetails}
+                goal={goal} canLog={Boolean(user && db)} logging={logging === p.startStr}
+                onSet={v => patch({ overrides: { ...prefs.overrides, [p.startStr]: v } })}
+                onReset={() => { const next = { ...prefs.overrides }; delete next[p.startStr]; patch({ overrides: next }); }}
+                onLog={() => logContribution(p)} />
+            ))}
           </>
         )}
       </div>
