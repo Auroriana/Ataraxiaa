@@ -1517,6 +1517,8 @@ function PlanCycleCard({ p, price, cushion, isBuy, isReady, showDetails, goal, c
   const low = !short && p.closingCash < cushion;
   const pct = price > 0 ? Math.min(100, (p.fundAfter / price) * 100) : 0;
   const toLog = round2(p.setAside - p.goalLogged);
+  const fromOwn = round2(Math.min(p.setAside, Math.max(0, p.net)));
+  const fromCarried = round2(p.setAside - fromOwn);
   const cashTone = short ? 'text-red-600' : low ? 'text-amber-600' : 'text-emerald-700';
 
   return (
@@ -1525,6 +1527,7 @@ function PlanCycleCard({ p, price, cushion, isBuy, isReady, showDetails, goal, c
         <h3 className="font-bold text-gray-900 text-sm">{p.idx === 0 ? 'This cut-off' : `Cut-off ${p.idx + 1}`} · {shortDate(p.startStr)} – {shortDate(p.endStr)}</h3>
         {isReady && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Ready to buy</span>}
         {isBuy && !isReady && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">Target cut-off</span>}
+        {fromCarried > 0 && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Uses {formatPHP(fromCarried)} carried cash</span>}
         {short && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-700 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> Cash goes negative</span>}
         <span className="ml-auto text-[11px] text-gray-400">Starts {dayLabel(p.startStr)}</span>
       </div>
@@ -1575,6 +1578,11 @@ function PlanCycleCard({ p, price, cushion, isBuy, isReady, showDetails, goal, c
                 {p.overridden && <button onClick={onReset} className="text-[11px] font-bold px-2 py-2 rounded border border-gray-200 hover:bg-gray-50 text-gray-500">Reset</button>}
               </div>
               <p className="text-[11px] text-gray-400 mt-1">Even split suggests {formatPHP(p.autoAmount)}{p.goalLogged > 0 ? ` · already logged ${formatPHP(p.goalLogged)}` : ''}.</p>
+              {fromCarried > 0 ? (
+                <p className="text-[11px] text-amber-600 mt-1">{formatPHP(fromOwn)} comes from this cut-off's leftover and {formatPHP(fromCarried)} from cash carried in from earlier cut-offs.</p>
+              ) : (
+                <p className="text-[11px] text-emerald-700 mt-1">All of it comes from this cut-off's own leftover.</p>
+              )}
             </div>
 
             <div>
