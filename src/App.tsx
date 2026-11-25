@@ -12,7 +12,7 @@ import {
 import { 
   PieChart, Pie, Cell, Tooltip as RechartsTooltip, 
   ResponsiveContainer, Legend,
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, AreaChart, Area, ReferenceLine
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, AreaChart, Area, ReferenceLine, ComposedChart, Line
 } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { 
@@ -93,8 +93,10 @@ interface MergedCalendarViewProps {
 }
 interface SavingsDebtViewProps {
   user: User | null; db: Firestore | null; appId: string; savingsGoals: SavingsGoal[]; debts: Debt[]; expenses: Expense[];
-  cycles: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number;
+  cycles: CycleRow[]; projection: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number;
 }
+interface PurchasePlannerProps { cycles: CycleRow[]; goals: GoalWithProgress[]; todayStartStr: string; }
+interface PlanRow { label: string; startStr: string; fullLabel: string; income: number; spent: number; extra: number; balance: number; ready: boolean; }
 interface SplitPlannerProps { goals: GoalWithProgress[]; cycles: CycleRow[]; cutoffs: number[]; todayStartStr: string; cyclesPerMonth: number; }
 interface DayDetailsModalProps {
   isOpen: boolean; onClose: () => void; dateStr: string | null; expenses: Expense[]; fixedExpenses: FixedExpense[];
@@ -695,6 +697,14 @@ export default function App() {
     () => buildCycles({ expenses, incomes, fixedExpenses, incomeRules }, schedule, todayStartStr, viewedStartStr),
     [expenses, incomes, fixedExpenses, incomeRules, schedule, todayStartStr, viewedStartStr]
   );
+  const planHorizonStr = useMemo(() => {
+    const t = new Date();
+    return toYYYYMMDD(getActivePeriod(new Date(t.getFullYear(), t.getMonth() + 9, 1), settings.cutoffs).start);
+  }, [settings.cutoffs]);
+  const projection = useMemo(
+    () => buildCycles({ expenses, incomes, fixedExpenses, incomeRules }, schedule, todayStartStr, planHorizonStr),
+    [expenses, incomes, fixedExpenses, incomeRules, schedule, todayStartStr, planHorizonStr]
+  );
   const viewedRow = cycles.find(c => c.startStr === viewedStartStr);
   const cycleStats = useMemo(
     () => rowToStats(viewedRow ?? emptyRow(viewedStartStr, toYYYYMMDD(viewedCycle.end))),
@@ -876,7 +886,7 @@ export default function App() {
             <SavingsDebtView 
               user={user} db={db} appId={appId}
               savingsGoals={savingsGoals} debts={debts} expenses={expenses}
-              cycles={cycles} cutoffs={settings.cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth}
+              cycles={cycles} projection={projection} cutoffs={settings.cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth}
             />
           )}
           
@@ -1116,8 +1126,8 @@ function MergedCalendarView({
   );
 }
 
-function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycles, cutoffs, todayStartStr, cyclesPerMonth }: SavingsDebtViewProps) {
-  const [subTab, setSubTab] = useState<'overview' | 'split'>('overview');
+function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycles, projection, cutoffs, todayStartStr, cyclesPerMonth }: SavingsDebtViewProps) {
+  const [subTab, setSubTab] = useState<'overview' | 'split' | 'purchase'>('overview');
   const [goalName, setGoalName] = useState('');
   const [goalTarget, setGoalTarget] = useState('');
   const [debtName, setDebtName] = useState('');
@@ -1158,9 +1168,12 @@ function SavingsDebtView({ user, db, appId, savingsGoals, debts, expenses, cycle
       <div className="inline-flex bg-gray-100 p-1 rounded-lg">
         <button onClick={() => setSubTab('overview')} className={`px-4 py-1.5 text-sm font-bold rounded-md transition-colors ${subTab === 'overview' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500'}`}>Goals & Debts</button>
         <button onClick={() => setSubTab('split')} className={`px-4 py-1.5 text-sm font-bold rounded-md transition-colors ${subTab === 'split' ? 'bg-white shadow-sm text-emerald-700' : 'text-gray-500'}`}>Split Planner</button>
+        <button onClick={() => setSubTab('purchase')} className={`px-4 py-1.5 text-sm font-bold rounded-md transition-colors ${subTab === 'purchase' ? 'bg-white shadow-sm text-emerald-700' : 'text-gray-500'}`}>Purchase Planner</button>
       </div>
 
-      {subTab === 'split' ? (
+      {subTab === 'purchase' ? (
+        <PurchasePlanner goals={goalsWithProgress} cycles={projection} todayStartStr={todayStartStr} />
+      ) : subTab === 'split' ? (
         <SplitPlanner goals={goalsWithProgress} cycles={cycles} cutoffs={cutoffs} todayStartStr={todayStartStr} cyclesPerMonth={cyclesPerMonth} />
       ) : (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in slide-in-from-bottom-4 duration-300">
@@ -1425,6 +1438,183 @@ function SplitPlanner({ goals, cycles, cutoffs, todayStartStr, cyclesPerMonth }:
             <p className="text-[11px] text-gray-400 px-1">
               To track progress, log each contribution as an expense linked to the goal on the calendar. The goal's saved amount updates automatically.
             </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PurchasePlanner({ goals, cycles, todayStartStr }: PurchasePlannerProps) {
+  const [source, setSource] = useState<string>('custom');
+  const [customPrice, setCustomPrice] = useState('57990');
+  const [buffer, setBuffer] = useState('5000');
+  const [extra, setExtra] = useState(0);
+  const [cashOnHand, setCashOnHand] = useState('0');
+
+  const goal = goals.find(g => g.id === source);
+  const price = goal ? Math.max(0, num(goal.targetAmount) - goal.saved) : Math.max(0, num(customPrice));
+  const cushion = Math.max(0, num(buffer));
+  const target = price + cushion;
+  const startCash = num(cashOnHand);
+
+  const rows = useMemo<PlanRow[]>(() => {
+    const curIdx = cycles.findIndex(c => c.startStr === todayStartStr);
+    if (curIdx < 0) return [];
+    const todayStr = toYYYYMMDD(new Date());
+    const dailyExtra = (extra * 12) / 365;
+    let running = 0;
+    let extraSoFar = 0;
+    const out: PlanRow[] = [];
+    for (let i = curIdx; i < cycles.length; i++) {
+      const c = cycles[i];
+      running = i === curIdx ? round2(startCash + c.closingProjected) : round2(running + c.expectedIncome - c.totalExpenses);
+      const from = c.startStr > todayStr ? c.startStr : todayStr;
+      const extraThisCycle = round2(dailyExtra * Math.max(0, daysBetween(from, c.endStr) + 1));
+      extraSoFar = round2(extraSoFar + extraThisCycle);
+      const balance = round2(running - extraSoFar);
+      out.push({
+        label: i === curIdx ? 'Now' : shortDate(c.startStr),
+        startStr: c.startStr,
+        fullLabel: `${shortDate(c.startStr)} – ${shortDate(c.endStr)}`,
+        income: c.expectedIncome,
+        spent: round2(c.totalExpenses + extraThisCycle),
+        extra: extraThisCycle,
+        balance,
+        ready: balance >= target
+      });
+    }
+    return out;
+  }, [cycles, todayStartStr, extra, startCash, target]);
+
+  const hasIncome = rows.some(r => r.income > 0);
+  const firstReady = rows.findIndex(r => r.ready);
+  const readyRow = firstReady >= 0 ? rows[firstReady] : null;
+  const bestBalance = rows.reduce((m, r) => Math.max(m, r.balance), -Infinity);
+
+  let verdict: { tone: InsightTone; text: string } | null = null;
+  if (price > 0 && rows.length > 0) {
+    if (!hasIncome) verdict = { tone: 'info', text: 'No expected income found yet. Add your salary under Settings (income rules) and any one-off pay such as a 13th month or incentive on the calendar, so the projection has something to work with.' };
+    else if (!readyRow) verdict = { tone: 'bad', text: `At ${formatPHP(extra)} of extra spending a month, your balance tops out around ${formatPHP(bestBalance)} in the next ${plural(rows.length, 'cycle', 'cycles')}, short of the ${formatPHP(target)} you need. Lower the extra spending or the cushion.` };
+    else if (firstReady === 0) verdict = { tone: 'good', text: `You already cover the ${formatPHP(price)} plus a ${formatPHP(cushion)} cushion by the end of this cycle.` };
+    else verdict = { tone: 'good', text: `Earliest cycle that covers ${formatPHP(price)} plus a ${formatPHP(cushion)} cushion: ${readyRow.fullLabel}. You'd have ${formatPHP(readyRow.balance)} then, leaving ${formatPHP(readyRow.balance - price)} after the purchase.` };
+  }
+
+  const chartData = rows.map(r => ({ label: r.label, income: r.income, balance: r.balance }));
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 animate-in slide-in-from-bottom-4 duration-300">
+      <div className="lg:col-span-2 atx-card p-5 rounded-xl shadow-sm border-t-4 border-t-emerald-400 space-y-5 self-start">
+        <div>
+          <h2 className="text-lg font-bold text-emerald-800 flex items-center gap-2"><Wallet className="w-5 h-5"/> Can I buy it?</h2>
+          <p className="text-xs text-gray-500 mt-1">Uses your fixed expenses, income rules and logged entries to project your balance cycle by cycle.</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-bold text-gray-600 mb-1">What are you buying?</label>
+          <select value={source} onChange={e => setSource(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm bg-white outline-none">
+            <option value="custom">Something new (enter a price)</option>
+            {goals.length > 0 && <optgroup label="Your savings goals">{goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</optgroup>}
+          </select>
+          {goal ? (
+            <p className="text-[11px] text-gray-500 mt-2">Left to fund on this goal: <span className="font-bold text-gray-700">{formatPHP(price)}</span></p>
+          ) : (
+            <div className="flex gap-2 mt-2">
+              <input type="number" min="0" step="0.01" value={customPrice} onChange={e => setCustomPrice(e.target.value)} className="flex-1 p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" placeholder="Price ₱" />
+              <button onClick={() => setCustomPrice('55000')} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">55k</button>
+              <button onClick={() => setCustomPrice('57990')} className="px-2 text-[11px] font-bold rounded border border-gray-200 hover:bg-gray-50">57,990</button>
+            </div>
+          )}
+        </div>
+
+        <div>
+          <div className="flex justify-between items-baseline mb-1">
+            <label htmlFor="extra-spend" className="block text-xs font-bold text-gray-600">Extra spending per month</label>
+            <span className="text-sm font-bold text-emerald-700">{formatPHP(extra)}</span>
+          </div>
+          <input id="extra-spend" type="range" min="0" max="20000" step="500" value={extra} onChange={e => setExtra(Number(e.target.value))} className="w-full accent-emerald-500" />
+          <p className="text-[11px] text-gray-400 mt-1">Shopping and anything not already in your fixed expenses or logged entries.</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-bold text-gray-600 mb-1">Emergency cushion ₱</label>
+            <input type="number" min="0" step="500" value={buffer} onChange={e => setBuffer(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-gray-600 mb-1">Cash not in the app ₱</label>
+            <input type="number" min="0" step="500" value={cashOnHand} onChange={e => setCashOnHand(e.target.value)} className="w-full p-2 border border-gray-300 rounded text-sm outline-none focus:border-emerald-400" />
+          </div>
+        </div>
+      </div>
+
+      <div className="lg:col-span-3 space-y-6">
+        {price <= 0 || rows.length === 0 ? (
+          <div className="atx-card p-10 rounded-xl shadow-sm text-center text-gray-400">
+            <Wallet className="w-10 h-10 mx-auto mb-2 opacity-20" />
+            <p className="text-sm italic">{goal && price <= 0 ? `${goal.name} is already fully funded.` : 'Enter a price to see when your projected balance can cover it.'}</p>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <ReportStat title="Needed (price + cushion)" value={formatPHP(target)} sub={`${formatPHP(price)} + ${formatPHP(cushion)}`} />
+              <ReportStat title="Earliest cycle" value={readyRow ? (firstReady === 0 ? 'This cycle' : shortDate(readyRow.startStr)) : 'Not yet'} sub={readyRow ? readyRow.fullLabel : `Within ${plural(rows.length, 'cycle', 'cycles')}`} valueClass={readyRow ? 'text-emerald-700' : 'text-red-600'} />
+              <ReportStat title="Left after buying" value={readyRow ? formatPHP(readyRow.balance - price) : '—'} sub={readyRow ? `Balance then ${formatPHP(readyRow.balance)}` : undefined} />
+            </div>
+
+            {verdict && (
+              <div className={`p-3 rounded-lg border text-xs flex items-start gap-2 ${INSIGHT_BOX[verdict.tone]}`}>
+                <InsightIcon tone={verdict.tone} />
+                <p>{verdict.text}</p>
+              </div>
+            )}
+
+            <ChartCard title="Income and projected balance" subtitle="Bars are expected income per cycle. The line is your balance after spending and extra spending.">
+              <div className="h-72 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} interval={0} />
+                    <YAxis tickFormatter={(v: number) => compactPHP(v)} tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                    <RechartsTooltip formatter={(val: unknown) => formatPHP(Number(val ?? 0))} contentStyle={TOOLTIP_STYLE} />
+                    <Legend iconType="circle" />
+                    <ReferenceLine y={price} stroke="#f59e0b" strokeDasharray="5 4" label={{ value: 'Price', position: 'insideTopLeft', fontSize: 10, fill: '#b45309' }} />
+                    <ReferenceLine y={target} stroke="#8b5cf6" strokeDasharray="5 4" label={{ value: 'Price + cushion', position: 'insideTopLeft', fontSize: 10, fill: '#6d28d9' }} />
+                    <Bar dataKey="income" name="Income" fill="#93c5fd" radius={[4, 4, 0, 0]} maxBarSize={28} />
+                    <Line type="monotone" dataKey="balance" name="Balance" stroke="#10b981" strokeWidth={2.5} dot={{ r: 3 }} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </ChartCard>
+
+            <div className="atx-card rounded-xl shadow-sm overflow-hidden">
+              <div className="px-5 py-3 border-b border-[var(--atx-border)] bg-gray-50">
+                <h3 className="font-bold text-gray-800 text-sm">Cycle by cycle</h3>
+                <p className="text-[11px] text-gray-500 mt-0.5">Balance is the closing balance of each cycle, assuming all expected income arrives.</p>
+              </div>
+              <div className="max-h-96 overflow-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-white sticky top-0 text-[11px] text-gray-400">
+                    <tr>
+                      <th className="text-left font-semibold px-5 py-2">Cycle</th>
+                      <th className="text-right font-semibold px-2 py-2">Income</th>
+                      <th className="text-right font-semibold px-2 py-2">Spent</th>
+                      <th className="text-right font-semibold px-5 py-2">Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r, i) => (
+                      <tr key={r.fullLabel} className={`border-t border-gray-100 ${i === firstReady ? 'bg-emerald-50' : ''}`}>
+                        <td className="px-5 py-2 text-gray-600 whitespace-nowrap">{r.fullLabel}{i === 0 ? <span className="text-gray-400"> · now</span> : null}</td>
+                        <td className="px-2 py-2 text-right text-gray-700">{formatPHP(r.income)}</td>
+                        <td className="px-2 py-2 text-right text-gray-500">{formatPHP(r.spent)}</td>
+                        <td className={`px-5 py-2 text-right font-bold ${r.ready ? 'text-emerald-700' : 'text-gray-800'}`}>{formatPHP(r.balance)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </>
         )}
       </div>
